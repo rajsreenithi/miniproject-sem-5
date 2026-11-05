@@ -1,0 +1,344 @@
+File: engine/annotate.py
+"""OpenCV drawing helpers for the AuraVision vision engine."""
+
+from typing import Mapping, Sequence
+
+import cv2
+import numpy as np
+from numpy.typing import NDArray
+
+from engine.tracker import Point, Track
+from engine.zones import Polygon
+
+
+Image = NDArray[np.uint8]
+Line = tuple[Point, Point]
+
+
+class FrameAnnotator:
+    """Draw people, zone boundaries, counts, and a counting line."""
+
+    def __init__(self, thickness: int = 2) -> None:
+        """Initialize drawing settings."""
+        if thickness <= 0:
+            raise ValueError("thickness must be positive")
+
+        self.thickness = thickness
+
+    def annotate(
+        self,
+        frame: Image,
+        tracks: Sequence[Track],
+        zones: Mapping[int, Polygon] | None = None,
+        counts: Mapping[int, int] | None = None,
+        line: Line | None = None,
+    ) -> Image:
+        """Return an annotated copy of a BGR frame."""
+        if frame is None or frame.size == 0:
+            raise ValueError("frame must not be empty")
+
+        output = frame.copy()
+        counts = counts or {}
+        zones = zones or {}
+
+        for track in tracks:
+            x1, y1, x2, y2 = track.bbox
+
+            cv2.rectangle(
+                output,
+                (x1, y1),
+                (x2, y2),
+                (0, 220, 0),
+                self.thickness,
+            )
+
+            label = (
+                f"ID {track.track_id} "
+                f"{track.confidence:.2f}"
+            )
+
+            cv2.putText(
+                output,
+                label,
+                (x1, max(20, y1 - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (0, 220, 0),
+                self.thickness,
+                cv2.LINE_AA,
+            )
+
+            foot_x = int(round(track.foot_point[0]))
+            foot_y = int(round(track.foot_point[1]))
+
+            cv2.circle(
+                output,
+                (foot_x, foot_y),
+                4,
+                (0, 0, 255),
+                -1,
+            )
+
+        for zone_id, polygon in zones.items():
+            points = np.array(
+                [
+                    [int(round(x)), int(round(y))]
+                    for x, y in polygon
+                ],
+                dtype=np.int32,
+            ).reshape((-1, 1, 2))
+
+            cv2.polylines(
+                output,
+                [points],
+                True,
+                (255, 180, 0),
+                self.thickness,
+            )
+
+            anchor_x, anchor_y = points[0, 0]
+
+            cv2.putText(
+                output,
+                f"Zone {zone_id}: {counts.get(zone_id, 0)}",
+                (int(anchor_x), max(20, int(anchor_y) - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 180, 0),
+                self.thickness,
+                cv2.LINE_AA,
+            )
+
+        if line is not None:
+            start, end = line
+
+            cv2.line(
+                output,
+                (int(round(start[0])), int(round(start[1]))),
+                (int(round(end[0])), int(round(end[1]))),
+                (0, 0, 255),
+                self.thickness,
+            )
+
+        return output
+
+
+def annotate_frame(
+    frame: Image,
+    tracks: Sequence[Track],
+    zones: Mapping[int, Polygon] | None = None,
+    counts: Mapping[int, int] | None = None,
+    line: Line | None = None,
+) -> Image:
+    """Convenience function for annotating a single frame."""
+    annotator = FrameAnnotator()
+    return annotator.annotate(
+        frame=frame,
+        tracks=tracks,
+        zones=zones,
+        counts=counts,
+        line=line,
+    )
+B.9  Engine Package Init
+File: engine/__init__.py
+"""AuraVision vision-engine package."""
+
+from engine.tracker import Track
+from engine.detector import PersonDetector
+from engine.zones import ZoneMonitor, Visit
+from engine.linecount import LineCounter, Crossing
+from engine.heatmap import HeatmapAccumulator
+from engine.annotate import FrameAnnotator, annotate_frame
+
+__all__ = [
+    "Track",
+    "PersonDetector",
+    "ZoneMonitor",
+    "Visit",
+    "LineCounter",
+    "Crossing",
+    "HeatmapAccumulator",
+    "FrameAnnotator",
+    "annotate_frame",
+]
+Rules and Incidents (rules/)
+B.10  Rule Engine
+File: rules/engine.py
+
+"""Load and evaluate site rules and schedules."""
+from __future__ import annotations
+
+from datetime import date, datetime, time, timedelta
+from typing import Any, Callable
+
+
+def _as_dicts(cursor: Any) -> list[dict[str, Any]]:
+    """Convert either dictionary-cursor or tuple-cursor rows to dictionaries."""
+    rows = cursor.fetchall()
+    if not rows:
+        return []
+    if isinstance(rows[0], dict):
+        return rows
+    names = [column[0] for column in cursor.description]
+    return [dict(zip(names, row)) for row in rows]
+
+
+def _as_time(value):
+    """Convert MySQL TIME values, timedeltas, or strings to datetime.time."""
+    if isinstance(value, time):
+        return value
+
+    if isinstance(value, timedelta):
+        total_seconds = int(value.total_seconds()) % 86400
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        seconds = total_seconds % 60
+        return time(hours, minutes, seconds)
+
+    return time.fromisoformat(str(value))
+
+
+def is_restricted_for_schedule(now: datetime, schedule_slots: list[dict[str, Any]],
+                                schedule_exceptions: list[dict[str, Any]]) -> bool:
+    """Shared schedule decision: today's exception overrides weekly class slots."""
+    todays_exceptions = [
+        row for row in schedule_exceptions
+        if row["on_date"] == now.date()
+        or str(row["on_date"]) == now.date().isoformat()
+    ]
+    if todays_exceptions:
+        return str(todays_exceptions[-1]["mode"]).lower() == "restricted"
+
+    current_time = now.time()
+    for slot in schedule_slots:
+        if int(slot["day_of_week"]) != now.isoweekday():
+            continue
+        if str(slot["slot_type"]).lower() != "class":
+            continue
+        start, end = _as_time(slot["start_time"]), _as_time(slot["end_time"])
+        if start <= end and start <= current_time < end:
+            return True
+        if start > end and (current_time >= start or current_time < end):
+            return True
+    return False
+
+
+def schedule_period_label(now: datetime, schedule_slots: list[dict[str, Any]],
+                          schedule_exceptions: list[dict[str, Any]]) -> str:
+    """Return a human-readable current class/break/outside-hours state."""
+    todays_exceptions = [
+        row for row in schedule_exceptions
+        if row["on_date"] == now.date()
+        or str(row["on_date"]) == now.date().isoformat()
+    ]
+    if todays_exceptions:
+        mode = str(todays_exceptions[-1]["mode"]).lower()
+        return "Break" if mode == "unrestricted" else "Class period"
+
+    for slot in schedule_slots:
+        if int(slot["day_of_week"]) != now.isoweekday():
+            continue
+        start, end = _as_time(slot["start_time"]), _as_time(slot["end_time"])
+        current = now.time()
+        matches = (start <= current < end) if start <= end else (current >= start or current < end)
+        if matches:
+            return "Class period" if str(slot["slot_type"]).lower() == "class" else "Break"
+    return "Outside college hours"
+
+
+class RuleEngine:
+    """Cache site rules and schedules, refreshing every 60 seconds."""
+
+    RELOAD_INTERVAL_SEC = 60.0
+
+    def __init__(
+        self,
+        site_id: int,
+        connection_factory: Callable[[], Any],
+        clock: Callable[[], datetime] = datetime.now,
+    ) -> None:
+        self.site_id = int(site_id)
+        self.connection_factory = connection_factory
+        self.clock = clock
+        self.rules: list[dict[str, Any]] = []
+        self.schedule_slots: list[dict[str, Any]] = []
+        self.schedule_exceptions: list[dict[str, Any]] = []
+        self._last_reload: datetime | None = None
+        self.reload()
+
+    def reload(self) -> None:
+        """Read active rules and both schedule tables in one connection."""
+        with self.connection_factory() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT rule_id, site_id, rule_type, min_people,
+                           min_duration_sec, clear_after_sec, cooldown_sec,
+                           is_active
+                    FROM rules
+                    WHERE site_id = %s AND is_active = %s
+                    ORDER BY rule_id
+                    """,
+                    (self.site_id, 1),
+                )
+                rules = _as_dicts(cursor)
+
+                cursor.execute(
+                    """
+                    SELECT slot_id, site_id, day_of_week, start_time,
+                           end_time, slot_type
+                    FROM schedule_slots
+                    WHERE site_id = %s
+                    ORDER BY day_of_week, start_time, slot_id
+                    """,
+                    (self.site_id,),
+                )
+                slots = _as_dicts(cursor)
+
+                cursor.execute(
+                    """
+                    SELECT exception_id, site_id, on_date, mode, note
+                    FROM schedule_exceptions
+                    WHERE site_id = %s
+                    ORDER BY on_date, exception_id
+                    """,
+                    (self.site_id,),
+                )
+                exceptions = _as_dicts(cursor)
+
+        self.rules = rules
+        self.schedule_slots = slots
+        self.schedule_exceptions = exceptions
+        self._last_reload = self.clock()
+
+    def refresh_if_due(self, now: datetime | None = None) -> None:
+        """Reload initially or when 60 seconds have elapsed."""
+        now = now or self.clock()
+        if (
+            self._last_reload is None
+            or (now - self._last_reload).total_seconds()
+            >= self.RELOAD_INTERVAL_SEC
+        ):
+            self.reload()
+
+    def is_restricted(self, now: datetime | None = None) -> bool:
+        """Apply the shared schedule decision, including today's exception."""
+        now = now or self.clock()
+        self.refresh_if_due(now)
+        return is_restricted_for_schedule(now, self.schedule_slots, self.schedule_exceptions)
+
+    def get_rules(self, now: datetime | None = None) -> list[dict[str, Any]]:
+        """Return rules eligible at this time."""
+        now = now or self.clock()
+        self.refresh_if_due(now)
+        restricted = self.is_restricted(now)
+
+        return [
+            rule
+            for rule in self.rules
+            if rule["rule_type"] == "occupancy_limit"
+            or (
+                rule["rule_type"] == "restricted_presence"
+                and restricted
+            )
+        ]
