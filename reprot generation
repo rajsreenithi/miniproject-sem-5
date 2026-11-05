@@ -1,0 +1,1306 @@
+B.19  PDF Report Generator
+File: web/report_pdf.py
+
+"""In-memory report data, charts, and PDF generation for AuraVision.
+
+All SQL is parameterized and uses the exact columns from schema.sql.
+Matplotlib uses Agg and all rendered charts/PDFs stay in memory.
+"""
+from __future__ import annotations
+
+from datetime import date, datetime, time, timedelta
+from io import BytesIO
+from pathlib import Path
+from typing import Any
+
+import matplotlib
+matplotlib.use("Agg")
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
+
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_LEFT
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import mm
+from reportlab.platypus import (
+    Image,
+    Paragraph,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
+)
+
+from web.db_helpers import fetch_all
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+HEATMAP_DIR = BASE_DIR / "data" / "heatmaps"
+
+THEMES = {
+    "retail": "#2457A7",
+    "water_point": "#16836D",
+}
+
+
+def _as_date(value: Any) -> date | None:
+    if isinstance(value, datetime):
+        return value.date()
+
+    if isinstance(value, date):
+        return value
+
+    try:
+        return date.fromisoformat(str(value)[:10]) if value else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_time(value: Any) -> time | None:
+    if isinstance(value, time):
+        return value
+
+    if isinstance(value, timedelta):
+        seconds = int(value.total_seconds()) % 86400
+        return time(
+            seconds // 3600,
+            (seconds % 3600) // 60,
+            seconds % 60,
+        )
+
+    try:
+        return time.fromisoformat(str(value)) if value else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+
+    if isinstance(value, date):
+        return datetime.combine(value, time.min)
+
+    try:
+        return datetime.fromisoformat(str(value)) if value else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _duration(seconds: Any) -> str:
+    try:
+        total = max(0, int(seconds or 0))
+    except (TypeError, ValueError):
+        total = 0
+
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+
+    if hours:
+        return f"{hours} hr {minutes} min" if minutes else f"{hours} hr"
+
+    if minutes:
+        return f"{minutes} min" if not secs else f"{minutes} min {secs} sec"
+
+    return f"{secs} sec"
+
+
+def _minutes_for_slot(slot: dict, day: date) -> int:
+    start = _as_time(slot.get("start_time"))
+    end = _as_time(slot.get("end_time"))
+
+    if not start or not end or end <= start:
+        return 0
+
+    return int(
+        (
+            datetime.combine(day, end)
+            - datetime.combine(day, start)
+        ).total_seconds() // 60
+    )
+
+
+def _period_class_minutes(
+    slots: list[dict],
+    start_date: date,
+    end_date: date,
+) -> int:
+    total = 0
+    current = start_date
+
+    while current <= end_date:
+        weekday = current.isoweekday()
+
+        for slot in slots:
+            if (
+                int(slot.get("day_of_week") or 0) == weekday
+                and slot.get("slot_type") == "class"
+            ):
+                total += _minutes_for_slot(slot, current)
+
+        current += timedelta(days=1)
+
+    return total
+
+
+def build_report_data(
+    site: dict | None,
+    start_date: date,
+    end_date: date,
+) -> dict:
+    """Load a site's report data, returning safe empty data when no site exists."""
+    site = dict(site or {})
+    site_id = site.get("site_id")
+    site_type = str(site.get("site_type") or "retail")
+
+    start_dt = datetime.combine(start_date, time.min)
+    end_exclusive = datetime.combine(
+        end_date + timedelta(days=1),
+        time.min,
+    )
+
+    data = {
+        "site": site,
+        "site_type": site_type,
+        "theme": THEMES.get(site_type, THEMES["retail"]),
+        "start_date": start_date,
+        "end_date": end_date,
+        "generated_at": datetime.now(),
+        "incidents": [],
+        "crossings": [],
+        "visits": [],
+        "hourly": [0] * 24,
+        "incident_hours": [0] * 24,
+        "incident_weekdays": [0] * 7,
+        "rules": [],
+        "schedule_slots": [],
+        "cameras": [],
+        "heatmap_path": None,
+        "heatmap_date": None,
+        "entries": 0,
+        "exits": 0,
+        "average_dwell_sec": 0,
+        "busiest_hour": None,
+        "incident_count": 0,
+        "violations": 0,
+        "violation_seconds": 0,
+        "longest_seconds": 0,
+        "peak_count": 0,
+        "class_minutes": 0,
+        "compliance_pct": None,
+        "summary_sentences": [],
+    }
+
+    if not site_id:
+        data["summary_sentences"] = [
+            "No site is currently selected.",
+            "No report data is available for this period.",
+            "Choose a site to generate a report.",
+        ]
+        return data
+
+    data["incidents"] = fetch_all(
+        """
+        SELECT
+            i.incident_id,
+            i.started_at,
+            i.ended_at,
+            i.duration_sec,
+            i.peak_count,
+            i.status,
+            c.camera_id,
+            c.name AS camera_name,
+            c.floor_label,
+            r.rule_type,
+            COALESCE(a.alert_status, 'No alerts') AS alert_status
+        FROM incidents i
+        JOIN cameras c ON c.camera_id = i.camera_id
+        JOIN rules r ON r.rule_id = i.rule_id
+        LEFT JOIN (
+            SELECT
+                incident_id,
+                GROUP_CONCAT(
+                    DISTINCT status
+                    ORDER BY status
+                    SEPARATOR ', '
+                ) AS alert_status
+            FROM alerts
+            GROUP BY incident_id
+        ) a ON a.incident_id = i.incident_id
+        WHERE c.site_id = %s
+          AND i.started_at >= %s
+          AND i.started_at < %s
+        ORDER BY i.started_at, i.incident_id
+        """,
+        (site_id, start_dt, end_exclusive),
+    )
+
+    data["crossings"] = fetch_all(
+        """
+        SELECT
+            x.crossing_id,
+            x.ts,
+            x.direction,
+            x.camera_id
+        FROM crossings x
+        JOIN cameras c ON c.camera_id = x.camera_id
+        WHERE c.site_id = %s
+          AND x.ts >= %s
+          AND x.ts < %s
+        ORDER BY x.ts
+        """,
+        (site_id, start_dt, end_exclusive),
+    )
+
+    data["visits"] = fetch_all(
+        """
+        SELECT
+            v.visit_id,
+            v.entered_at,
+            v.left_at,
+            v.dwell_sec,
+            v.camera_id
+        FROM visits v
+        JOIN cameras c ON c.camera_id = v.camera_id
+        WHERE c.site_id = %s
+          AND v.entered_at >= %s
+          AND v.entered_at < %s
+        ORDER BY v.entered_at
+        """,
+        (site_id, start_dt, end_exclusive),
+    )
+
+    data["rules"] = fetch_all(
+        """
+        SELECT
+            rule_id,
+            rule_type,
+            min_people,
+            min_duration_sec,
+            clear_after_sec,
+            cooldown_sec,
+            is_active
+        FROM rules
+        WHERE site_id = %s
+          AND is_active = %s
+        ORDER BY rule_id
+        """,
+        (site_id, 1),
+    )
+
+    data["schedule_slots"] = fetch_all(
+        """
+        SELECT
+            day_of_week,
+            start_time,
+            end_time,
+            slot_type
+        FROM schedule_slots
+        WHERE site_id = %s
+        ORDER BY day_of_week, start_time
+        """,
+        (site_id,),
+    )
+
+    data["cameras"] = fetch_all(
+        """
+        SELECT camera_id, name, floor_label, is_active
+        FROM cameras
+        WHERE site_id = %s
+        ORDER BY camera_id
+        """,
+        (site_id,),
+    )
+
+    for row in data["crossings"]:
+        stamp = _as_datetime(row.get("ts"))
+
+        if stamp:
+            data["hourly"][stamp.hour] += 1
+
+            if row.get("direction") == "in":
+                data["entries"] += 1
+            elif row.get("direction") == "out":
+                data["exits"] += 1
+
+    data["incident_count"] = len(data["incidents"])
+
+    for row in data["incidents"]:
+        stamp = _as_datetime(row.get("started_at"))
+
+        if stamp:
+            data["incident_hours"][stamp.hour] += 1
+            data["incident_weekdays"][stamp.weekday()] += 1
+
+        try:
+            duration = int(row.get("duration_sec") or 0)
+        except (TypeError, ValueError):
+            duration = 0
+
+        if row.get("duration_sec") is None and row.get("ended_at") is None:
+            started = _as_datetime(row.get("started_at"))
+
+            if started:
+                duration = max(
+                    0,
+                    int((datetime.now() - started).total_seconds()),
+                )
+
+        row["duration_human"] = _duration(duration)
+
+        is_violation = row.get("rule_type") == "restricted_presence"
+
+        if site_type == "water_point":
+            if is_violation:
+                data["violations"] += 1
+                data["violation_seconds"] += duration
+                data["longest_seconds"] = max(
+                    data["longest_seconds"],
+                    duration,
+                )
+                data["peak_count"] = max(
+                    data["peak_count"],
+                    int(row.get("peak_count") or 0),
+                )
+        else:
+            data["longest_seconds"] = max(
+                data["longest_seconds"],
+                duration,
+            )
+            data["peak_count"] = max(
+                data["peak_count"],
+                int(row.get("peak_count") or 0),
+            )
+
+    dwell_values = [
+        int(row.get("dwell_sec") or 0)
+        for row in data["visits"]
+    ]
+
+    data["average_dwell_sec"] = (
+        round(sum(dwell_values) / len(dwell_values))
+        if dwell_values
+        else 0
+    )
+
+    activity = (
+        data["incident_hours"]
+        if site_type == "water_point"
+        else data["hourly"]
+    )
+
+    if any(activity):
+        data["busiest_hour"] = max(
+            range(24),
+            key=lambda hour: activity[hour],
+        )
+
+    data["class_minutes"] = _period_class_minutes(
+        data["schedule_slots"],
+        start_date,
+        end_date,
+    )
+
+    if site_type == "water_point" and data["class_minutes"] > 0:
+        data["compliance_pct"] = round(
+            100
+            * (
+                1
+                - data["violation_seconds"]
+                / 60
+                / data["class_minutes"]
+            ),
+            1,
+        )
+
+    heatmap = next(
+        (
+            HEATMAP_DIR / f"camera_{cam['camera_id']}.png"
+            for cam in data["cameras"]
+            if (
+                HEATMAP_DIR / f"camera_{cam['camera_id']}.png"
+            ).is_file()
+        ),
+        None,
+    )
+
+    if heatmap:
+        data["heatmap_path"] = heatmap
+
+        try:
+            data["heatmap_date"] = datetime.fromtimestamp(
+                heatmap.stat().st_mtime
+            )
+        except OSError:
+            data["heatmap_path"] = None
+
+    period = (
+        f"{start_date.strftime('%d %b')}"
+        f"–{end_date.strftime('%d %b %Y')}"
+    )
+
+    longest = max(
+        data["incidents"],
+        key=lambda row: int(row.get("duration_sec") or 0),
+        default=None,
+    )
+
+    busiest = data["busiest_hour"]
+
+    if site_type == "water_point":
+        data["summary_sentences"] = [
+            (
+                f"Between {period}, {data['violations']} "
+                "gathering violation(s) were recorded."
+            ),
+            (
+                f"The longest recorded gathering lasted "
+                f"{_duration(data['longest_seconds'])} on "
+                f"{longest.get('floor_label') or longest.get('camera_name') or 'an unlabelled floor'}."
+                if longest
+                else "No incidents were recorded in this period."
+            ),
+            (
+                f"The busiest hour for recorded incidents was "
+                f"{busiest:02d}:00–{(busiest + 1) % 24:02d}:00."
+                if busiest is not None
+                else "No hourly activity was recorded in this period."
+            ),
+            (
+                f"Class-time compliance was {data['compliance_pct']:.1f}% "
+                "based on the configured timetable."
+                if data["compliance_pct"] is not None
+                else "Class-time compliance could not be calculated "
+                     "because no class minutes were configured."
+            ),
+        ]
+    else:
+        data["summary_sentences"] = [
+            f"Between {period}, {data['incident_count']} incident(s) occurred.",
+            (
+                f"The longest lasted {_duration(data['longest_seconds'])} on "
+                f"{longest.get('floor_label') or longest.get('camera_name') or 'an unlabelled floor'}."
+                if longest
+                else "No incidents were recorded in this period."
+            ),
+            (
+                f"The busiest activity slot was "
+                f"{busiest:02d}:00–{(busiest + 1) % 24:02d}:00."
+                if busiest is not None
+                else "No crossing activity was recorded in this period."
+            ),
+            (
+                f"The site recorded {data['entries']} entries "
+                f"and {data['exits']} exits."
+            ),
+        ]
+
+    return data
+
+
+def build_chart_png(data: dict, chart_kind: str) -> BytesIO:
+    """Create a chart in memory using Matplotlib's Agg renderer."""
+    figure = Figure(
+        figsize=(8.6, 3.0),
+        dpi=120,
+        tight_layout=True,
+    )
+    canvas = FigureCanvasAgg(figure)
+    axis = figure.add_subplot(1, 1, 1)
+    theme = data.get("theme", THEMES["retail"])
+
+    if chart_kind == "hourly":
+        values = (
+            data["incident_hours"]
+            if data["site_type"] == "water_point"
+            else data["hourly"]
+        )
+
+        axis.bar(range(24), values, color=theme, width=0.78)
+
+        if data["site_type"] == "water_point":
+            day_types: dict[int, set[str]] = {}
+
+            for slot in data["schedule_slots"]:
+                start = _as_time(slot.get("start_time"))
+                end = _as_time(slot.get("end_time"))
+
+                if start and end and end > start:
+                    end_hour = end.hour + (1 if end.minute else 0)
+
+                    for hour in range(start.hour, min(24, end_hour)):
+                        day_types.setdefault(hour, set()).add(
+                            str(slot.get("slot_type"))
+                        )
+
+            for hour, types in day_types.items():
+                if "class" in types:
+                    axis.axvspan(
+                        hour - 0.5,
+                        hour + 0.5,
+                        color="#ef4444",
+                        alpha=0.09,
+                        zorder=0,
+                    )
+
+                if "break" in types:
+                    axis.axvspan(
+                        hour - 0.5,
+                        hour + 0.5,
+                        color="#22c55e",
+                        alpha=0.12,
+                        zorder=0,
+                    )
+
+            axis.set_title(
+                "Hourly incidents (shading: class red, break green)"
+            )
+        else:
+            axis.set_title("Hourly crossing activity")
+
+        axis.set_xlabel("Hour of day")
+        axis.set_ylabel("Events")
+        axis.set_xticks(
+            range(0, 24, 2),
+            [f"{hour:02d}:00" for hour in range(0, 24, 2)],
+        )
+
+    else:
+        if (data["end_date"] - data["start_date"]).days <= 2:
+            values = data["incident_hours"]
+
+            axis.bar(range(24), values, color=theme, width=0.78)
+            axis.set_xticks(
+                range(0, 24, 2),
+                [f"{hour:02d}:00" for hour in range(0, 24, 2)],
+            )
+            axis.set_xlabel("Hour of day")
+            axis.set_title("Incidents by time slot")
+        else:
+            labels = [
+                "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"
+            ]
+
+            axis.bar(
+                labels,
+                data["incident_weekdays"],
+                color=theme,
+                width=0.68,
+            )
+            axis.set_xlabel("Weekday")
+            axis.set_title("Incidents by weekday")
+
+        axis.set_ylabel("Incidents")
+
+    axis.grid(axis="y", alpha=0.2)
+    axis.set_axisbelow(True)
+
+    output = BytesIO()
+    canvas.print_png(output)
+    output.seek(0)
+    figure.clear()
+
+    return output
+
+
+def build_heatmap_legend_png() -> BytesIO:
+    """Render a low-to-high colour legend in memory."""
+    figure = Figure(
+        figsize=(3.8, 0.42),
+        dpi=120,
+        tight_layout=True,
+    )
+    canvas = FigureCanvasAgg(figure)
+    axis = figure.add_subplot(1, 1, 1)
+
+    gradient = [[index / 100 for index in range(101)]]
+
+    axis.imshow(
+        gradient,
+        aspect="auto",
+        cmap="viridis",
+        extent=[0, 1, 0, 1],
+    )
+    axis.set_xticks([0, 1], ["LOW", "HIGH"])
+    axis.set_yticks([])
+    axis.tick_params(axis="x", labelsize=8, length=0, pad=2)
+
+    for spine in axis.spines.values():
+        spine.set_visible(False)
+
+    output = BytesIO()
+    canvas.print_png(output)
+    output.seek(0)
+    figure.clear()
+
+    return output
+
+
+def _make_numbered_canvas():
+    """Create a ReportLab canvas that numbers every page."""
+    from reportlab.pdfgen import canvas
+
+    class NumberedCanvas(canvas.Canvas):
+        def __init__(self, *args, **kwargs):
+            canvas.Canvas.__init__(self, *args, **kwargs)
+            self._saved_page_states = []
+
+        def showPage(self):
+            self._saved_page_states.append(dict(self.__dict__))
+            self._startPage()
+
+        def save(self):
+            total_pages = len(self._saved_page_states)
+
+            for state in self._saved_page_states:
+                self.__dict__.update(state)
+                self._draw_page_number(total_pages)
+                canvas.Canvas.showPage(self)
+
+            canvas.Canvas.save(self)
+
+        def _draw_page_number(self, page_count):
+            self.saveState()
+            self.setFont("Helvetica", 8)
+            self.setFillColor(colors.HexColor("#667085"))
+
+            self.drawString(
+                18 * mm,
+                10 * mm,
+                "AuraVision Smart Retail Analytics",
+            )
+
+            self.drawRightString(
+                A4[0] - 18 * mm,
+                10 * mm,
+                f"Page {self._pageNumber} of {page_count}",
+            )
+
+            self.setStrokeColor(colors.HexColor("#D0D5DD"))
+            self.line(
+                18 * mm,
+                14 * mm,
+                A4[0] - 18 * mm,
+                14 * mm,
+            )
+            self.restoreState()
+
+    return NumberedCanvas
+
+
+def build_pdf(data: dict, generated_by: str) -> bytes:
+    """Build the complete A4 PDF attachment entirely in memory."""
+    output = BytesIO()
+    theme = colors.HexColor(data.get("theme", THEMES["retail"]))
+    styles = getSampleStyleSheet()
+
+    styles.add(
+        ParagraphStyle(
+            name="AVTitle",
+            parent=styles["Title"],
+            fontName="Helvetica-Bold",
+            fontSize=23,
+            leading=27,
+            textColor=theme,
+            alignment=TA_LEFT,
+            spaceAfter=3,
+        )
+    )
+
+    styles.add(
+        ParagraphStyle(
+            name="AVSub",
+            parent=styles["Normal"],
+            fontSize=9,
+            leading=13,
+            textColor=colors.HexColor("#475467"),
+            spaceAfter=2,
+        )
+    )
+
+    styles.add(
+        ParagraphStyle(
+            name="AVSection",
+            parent=styles["Heading2"],
+            fontSize=13,
+            leading=16,
+            textColor=theme,
+            spaceBefore=8,
+            spaceAfter=6,
+        )
+    )
+
+    styles.add(
+        ParagraphStyle(
+            name="AVSmall",
+            parent=styles["Normal"],
+            fontSize=8,
+            leading=10,
+        )
+    )
+
+    styles.add(
+        ParagraphStyle(
+            name="AVSummary",
+            parent=styles["Normal"],
+            fontSize=9,
+            leading=13,
+            textColor=colors.HexColor("#344054"),
+        )
+    )
+
+    story = []
+    site = data.get("site") or {}
+    site_name = str(site.get("name") or "No site selected")
+
+    period = (
+        f"{data['start_date'].strftime('%d %b %Y')} – "
+        f"{data['end_date'].strftime('%d %b %Y')}"
+    )
+
+    story.append(Paragraph("AuraVision", styles["AVTitle"]))
+    story.append(
+        Paragraph("SMART RETAIL ANALYTICS", styles["AVSub"])
+    )
+    story.append(Spacer(1, 2 * mm))
+
+    story.append(
+        Paragraph(
+            f"<b>Site:</b> {site_name} &nbsp;&nbsp; "
+            f"<b>Type:</b> "
+            f"{data.get('site_type', 'retail').replace('_', ' ').title()}",
+            styles["Normal"],
+        )
+    )
+
+    story.append(
+        Paragraph(f"<b>Period:</b> {period}", styles["Normal"])
+    )
+
+    story.append(
+        Paragraph(
+            f"<b>Generated:</b> "
+            f"{data['generated_at'].strftime('%d %b %Y, %H:%M:%S')} "
+            f"&nbsp;&nbsp; <b>Generated by:</b> "
+            f"{generated_by or 'Unknown user'}",
+            styles["AVSmall"],
+        )
+    )
+
+    story.append(Spacer(1, 4 * mm))
+
+    summary_header_style = ParagraphStyle(
+        "AVSummaryHeader",
+        parent=styles["Normal"],
+        fontName="Helvetica-Bold",
+        textColor=colors.white,
+        fontSize=10,
+    )
+
+    summary_rows = [
+        [
+            Paragraph(
+                "REPORT SUMMARY",
+                summary_header_style,
+            )
+        ]
+    ]
+
+    summary_rows.extend(
+        [
+            [Paragraph(sentence, styles["AVSummary"])]
+            for sentence in data.get("summary_sentences", [])
+        ]
+    )
+
+    summary_table = Table(
+        summary_rows,
+        colWidths=[174 * mm],
+    )
+
+    summary_table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), theme),
+                (
+                    "BACKGROUND",
+                    (0, 1),
+                    (-1, -1),
+                    colors.HexColor("#F2F4F7"),
+                ),
+                ("BOX", (0, 0), (-1, -1), 0.6, theme),
+                ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+                ("TOPPADDING", (0, 0), (-1, -1), 6),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ]
+        )
+    )
+
+    story.append(summary_table)
+    story.append(
+        Paragraph("Key numbers", styles["AVSection"])
+    )
+
+    if data["site_type"] == "water_point":
+        metrics = [
+            ("Violations", data["violations"]),
+            (
+                "Violation minutes",
+                round(data["violation_seconds"] / 60, 1),
+            ),
+            (
+                "Longest gathering",
+                _duration(data["longest_seconds"]),
+            ),
+            ("Peak count", data["peak_count"]),
+            (
+                "Class-time compliance",
+                (
+                    f"{data['compliance_pct']:.1f}%"
+                    if data["compliance_pct"] is not None
+                    else "N/A"
+                ),
+            ),
+        ]
+    else:
+        metrics = [
+            ("Entries", data["entries"]),
+            ("Exits", data["exits"]),
+            (
+                "Average dwell",
+                _duration(data["average_dwell_sec"]),
+            ),
+            (
+                "Busiest hour",
+                (
+                    f"{data['busiest_hour']:02d}:00–"
+                    f"{(data['busiest_hour'] + 1) % 24:02d}:00"
+                    if data["busiest_hour"] is not None
+                    else "N/A"
+                ),
+            ),
+            ("Incidents", data["incident_count"]),
+        ]
+
+    metric_cells = [
+        [
+            Paragraph(
+                f"<b>{label}</b><br/>{value}",
+                styles["AVSmall"],
+            )
+            for label, value in metrics
+        ]
+    ]
+
+    metric_table = Table(
+        metric_cells,
+        colWidths=[174 * mm / len(metrics)] * len(metrics),
+    )
+
+    metric_table.setStyle(
+        TableStyle(
+            [
+                (
+                    "BACKGROUND",
+                    (0, 0),
+                    (-1, -1),
+                    colors.HexColor("#F9FAFB"),
+                ),
+                (
+                    "BOX",
+                    (0, 0),
+                    (-1, -1),
+                    0.5,
+                    colors.HexColor("#D0D5DD"),
+                ),
+                (
+                    "INNERGRID",
+                    (0, 0),
+                    (-1, -1),
+                    0.4,
+                    colors.HexColor("#D0D5DD"),
+                ),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                ("TOPPADDING", (0, 0), (-1, -1), 7),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+            ]
+        )
+    )
+
+    story.append(metric_table)
+
+    story.append(Paragraph("Charts", styles["AVSection"]))
+
+    for chart_kind, label in (
+        ("hourly", "Hourly activity"),
+        ("incidents", "Incidents by time slot or weekday"),
+    ):
+        chart_buffer = build_chart_png(data, chart_kind)
+
+        story.append(
+            Paragraph(label, styles["Heading4"])
+        )
+
+        story.append(
+            Image(
+                chart_buffer,
+                width=174 * mm,
+                height=61 * mm,
+            )
+        )
+
+        story.append(Spacer(1, 2 * mm))
+
+    heatmap_path = data.get("heatmap_path")
+
+    if heatmap_path and Path(heatmap_path).is_file():
+        try:
+            heatmap_bytes = Path(heatmap_path).read_bytes()
+
+            story.append(
+                Paragraph("Activity heatmap", styles["AVSection"])
+            )
+
+            story.append(
+                Image(
+                    BytesIO(heatmap_bytes),
+                    width=115 * mm,
+                    height=66 * mm,
+                    kind="proportional",
+                )
+            )
+
+            heatmap_date = data.get("heatmap_date")
+
+            date_text = (
+                heatmap_date.strftime("%d %b %Y, %H:%M")
+                if heatmap_date
+                else "date unavailable"
+            )
+
+            story.append(
+                Paragraph(
+                    "Activity intensity legend: low to high. "
+                    f"Heatmap generated/updated {date_text}.",
+                    styles["AVSmall"],
+                )
+            )
+
+            story.append(
+                Image(
+                    build_heatmap_legend_png(),
+                    width=72 * mm,
+                    height=8 * mm,
+                )
+            )
+
+        except (OSError, ValueError):
+            pass
+
+    story.append(
+        Paragraph("Incident table", styles["AVSection"])
+    )
+
+    incident_data = [
+        [
+            "Start",
+            "End",
+            "Duration",
+            "Peak",
+            "Floor",
+            "Alert status",
+        ]
+    ]
+
+    for row in data["incidents"]:
+        start = _as_datetime(row.get("started_at"))
+        end = _as_datetime(row.get("ended_at"))
+
+        incident_data.append(
+            [
+                (
+                    start.strftime("%d %b %Y %H:%M")
+                    if start
+                    else "—"
+                ),
+                (
+                    end.strftime("%d %b %Y %H:%M")
+                    if end
+                    else "Open"
+                ),
+                (
+                    row.get("duration_human")
+                    or _duration(row.get("duration_sec"))
+                ),
+                str(row.get("peak_count") or 0),
+                str(
+                    row.get("floor_label")
+                    or row.get("camera_name")
+                    or "—"
+                ),
+                str(row.get("alert_status") or "No alerts"),
+            ]
+        )
+
+    if len(incident_data) == 1:
+        incident_data.append(
+            [
+                "No incidents recorded for this period.",
+                "",
+                "",
+                "",
+                "",
+                "",
+            ]
+        )
+
+    incident_table = Table(
+        incident_data,
+        colWidths=[
+            31 * mm,
+            31 * mm,
+            23 * mm,
+            14 * mm,
+            35 * mm,
+            40 * mm,
+        ],
+        repeatRows=1,
+        hAlign="LEFT",
+    )
+
+    incident_table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), theme),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 7),
+                ("LEADING", (0, 0), (-1, -1), 9),
+                (
+                    "GRID",
+                    (0, 0),
+                    (-1, -1),
+                    0.35,
+                    colors.HexColor("#D0D5DD"),
+                ),
+                (
+                    "ROWBACKGROUNDS",
+                    (0, 1),
+                    (-1, -1),
+                    [
+                        colors.white,
+                        colors.HexColor("#F9FAFB"),
+                    ],
+                ),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ]
+        )
+    )
+
+    story.append(incident_table)
+
+    story.append(
+        Paragraph("Settings in effect", styles["AVSection"])
+    )
+
+    if data["rules"]:
+        rules_rows = [
+            [
+                "Active rule",
+                "Minimum people",
+                "Minimum duration",
+                "Clear after",
+                "Cooldown",
+            ]
+        ]
+
+        for rule in data["rules"]:
+            rules_rows.append(
+                [
+                    str(
+                        rule.get("rule_type", "")
+                    ).replace("_", " ").title(),
+                    str(rule.get("min_people", 2)),
+                    _duration(rule.get("min_duration_sec")),
+                    _duration(rule.get("clear_after_sec")),
+                    _duration(rule.get("cooldown_sec")),
+                ]
+            )
+
+        rules_table = Table(
+            rules_rows,
+            colWidths=[
+                43 * mm,
+                27 * mm,
+                34 * mm,
+                30 * mm,
+                28 * mm,
+            ],
+            repeatRows=1,
+        )
+
+        rules_table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), theme),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("FONTSIZE", (0, 0), (-1, -1), 7),
+                    (
+                        "GRID",
+                        (0, 0),
+                        (-1, -1),
+                        0.35,
+                        colors.HexColor("#D0D5DD"),
+                    ),
+                    (
+                        "ROWBACKGROUNDS",
+                        (0, 1),
+                        (-1, -1),
+                        [
+                            colors.white,
+                            colors.HexColor("#F9FAFB"),
+                        ],
+                    ),
+                ]
+            )
+        )
+
+        story.append(rules_table)
+
+    else:
+        story.append(
+            Paragraph(
+                "No active rules are configured for this site.",
+                styles["AVSmall"],
+            )
+        )
+
+    if data["site_type"] == "water_point":
+        day_names = {
+            1: "Monday",
+            2: "Tuesday",
+            3: "Wednesday",
+            4: "Thursday",
+            5: "Friday",
+            6: "Saturday",
+            7: "Sunday",
+        }
+
+        story.append(Spacer(1, 2 * mm))
+        story.append(
+            Paragraph("Weekly timetable", styles["Heading3"])
+        )
+
+        timetable_rows = [
+            ["Day", "Start", "End", "Type"]
+        ]
+
+        for slot in data["schedule_slots"]:
+            start = _as_time(slot.get("start_time"))
+            end = _as_time(slot.get("end_time"))
+
+            timetable_rows.append(
+                [
+                    day_names.get(
+                        int(slot.get("day_of_week") or 0),
+                        "Unknown",
+                    ),
+                    (
+                        start.strftime("%H:%M")
+                        if start
+                        else "—"
+                    ),
+                    (
+                        end.strftime("%H:%M")
+                        if end
+                        else "—"
+                    ),
+                    str(slot.get("slot_type", "")).title(),
+                ]
+            )
+
+        if len(timetable_rows) == 1:
+            timetable_rows.append(
+                ["No weekly timetable configured", "", "", ""]
+            )
+
+        timetable = Table(
+            timetable_rows,
+            colWidths=[
+                55 * mm,
+                30 * mm,
+                30 * mm,
+                47 * mm,
+            ],
+            repeatRows=1,
+        )
+
+        timetable.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), theme),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("FONTSIZE", (0, 0), (-1, -1), 8),
+                    (
+                        "GRID",
+                        (0, 0),
+                        (-1, -1),
+                        0.35,
+                        colors.HexColor("#D0D5DD"),
+                    ),
+                    (
+                        "ROWBACKGROUNDS",
+                        (0, 1),
+                        (-1, -1),
+                        [
+                            colors.white,
+                            colors.HexColor("#F9FAFB"),
+                        ],
+                    ),
+                ]
+            )
+        )
+
+        story.append(timetable)
+
+    story.append(
+        Paragraph("Notes", styles["AVSection"])
+    )
+
+    story.append(
+        Paragraph(
+            "Class-time compliance = 100 x "
+            "(1 - violation minutes / class minutes in the selected "
+            "period). It cannot be calculated when no class minutes "
+            "are configured. AuraVision stores counts and timings "
+            "only, never faces or identities.",
+            styles["AVSmall"],
+        )
+    )
+
+    doc = SimpleDocTemplate(
+        output,
+        pagesize=A4,
+        rightMargin=18 * mm,
+        leftMargin=18 * mm,
+        topMargin=15 * mm,
+        bottomMargin=19 * mm,
+        title=f"AuraVision report - {site_name}",
+        author="AuraVision Smart Retail Analytics",
+    )
+
+    doc.build(
+        story,
+        canvasmaker=_make_numbered_canvas(),
+    )
+
+    return output.getvalue()
