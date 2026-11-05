@@ -1,0 +1,248 @@
+File: web/templates/base.html
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}AuraVision{% endblock %} • AuraVision</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/bootstrap.min.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/custom.css') }}">
+  {% block head %}{% endblock %}
+</head>
+<body class="theme-{{ ('water' if current_site and current_site.site_type == 'water_point' else 'retail') }}">
+{% if current_user %}
+<div class="app-shell">
+  <aside class="sidebar d-none d-lg-flex flex-column">
+    <a class="brand" href="{{ url_for('dashboard') }}"><span class="brand-mark">A</span><span><strong>AuraVision</strong><small>SMART ANALYTICS</small></span></a>
+    <div class="nav-caption">MONITORING</div>
+    <nav class="side-nav">
+      <a href="{{ url_for('dashboard') }}" class="nav-link {% if request.endpoint == 'dashboard' %}active{% endif %}"><span class="nav-icon">▦</span>Overview</a>
+      <a href="{{ url_for('dashboard_pages.live') }}" class="nav-link {% if request.endpoint == 'dashboard_pages.live' %}active{% endif %}"><span class="nav-icon">◉</span>Live cameras</a>
+      <a href="{{ url_for('dashboard_pages.incidents') }}" class="nav-link {% if request.endpoint == 'dashboard_pages.incidents' %}active{% endif %}"><span class="nav-icon">⚠</span>Incidents</a>
+      <a href="{{ url_for('dashboard_pages.heatmap') }}" class="nav-link {% if request.endpoint == 'dashboard_pages.heatmap' %}active{% endif %}"><span class="nav-icon">◈</span>Heatmap</a>
+      <a href="{{ url_for('dashboard_pages.reports') }}" class="nav-link {% if request.endpoint == 'dashboard_pages.reports' %}active{% endif %}"><span class="nav-icon">▤</span>Reports</a>
+    </nav>
+    {% if current_site and current_site.site_type == 'water_point' %}
+    <div class="nav-caption">WATER POINT</div>
+    <nav class="side-nav">
+      <a href="{{ url_for('admin.schedule') }}" class="nav-link {% if request.endpoint == 'admin.schedule' %}active{% endif %}"><span class="nav-icon">▦</span>Schedule</a>
+    </nav>
+    {% endif %}
+    {% if current_user.role in ['admin','hod'] %}
+    <div class="nav-caption">MANAGEMENT</div>
+    <nav class="side-nav">
+      <a href="{{ url_for('admin.rules') }}" class="nav-link {% if request.endpoint == 'admin.rules' %}active{% endif %}"><span class="nav-icon">◇</span>Rules engine</a>
+      <a href="{{ url_for('admin.recipients') }}" class="nav-link {% if request.endpoint == 'admin.recipients' %}active{% endif %}"><span class="nav-icon">♧</span>Recipients</a>
+      {% if current_user.role == 'admin' %}<a href="{{ url_for('admin.cameras') }}" class="nav-link {% if request.endpoint == 'admin.cameras' %}active{% endif %}"><span class="nav-icon">▣</span>Cameras</a>{% endif %}
+    </nav>
+    {% endif %}
+    <div class="sidebar-bottom">
+      <div class="sidebar-status">
+        <span class="status-dot {{ 'is-online' if worker_online else 'is-offline' }}"></span>
+        <span><b>Worker status</b><small class="{{ 'worker-online' if worker_online else 'worker-offline' }}">{{ 'Worker online' if worker_online else 'Worker offline' }}</small></span>
+      </div>
+      <small class="sidebar-version">AuraVision • v1.0</small>
+    </div>
+  </aside>
+  <div class="main-area">
+    <header class="topbar">
+      <button class="mobile-menu btn btn-light d-lg-none" type="button" data-bs-toggle="offcanvas" data-bs-target="#mobileNav" aria-controls="mobileNav" aria-label="Open navigation">☰</button>
+      <div class="topbar-site"><span class="site-label">SITE TYPE</span><div class="site-switch" role="group" aria-label="Switch site type">
+        {% set ns = namespace(retail=None, water=None) %}
+        {% for s in layout_sites %}
+          {% if s.site_type == 'retail' and ns.retail is none %}{% set ns.retail = s %}{% endif %}
+          {% if s.site_type == 'water_point' and ns.water is none %}{% set ns.water = s %}{% endif %}
+        {% endfor %}
+        {% if ns.retail %}
+        <form action="{{ url_for('admin.set_site') }}" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="site_id" value="{{ ns.retail.site_id }}"><button class="site-switch-btn {{ 'active' if current_site and current_site.site_id == ns.retail.site_id else '' }}" type="submit">Retail</button></form>
+        {% endif %}
+        {% if ns.water %}
+        <form action="{{ url_for('admin.set_site') }}" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="site_id" value="{{ ns.water.site_id }}"><button class="site-switch-btn {{ 'active' if current_site and current_site.site_id == ns.water.site_id else '' }}" type="submit">Water point</button></form>
+        {% endif %}
+      </div></div>
+      <div class="topbar-user"><div class="avatar">{{ current_user.username[:1]|upper }}</div><div class="user-details"><strong>{{ current_user.username }}</strong><small>{{ current_user.role|upper }}</small></div><span class="role-badge">{{ current_user.role }}</span><form method="post" action="{{ url_for('auth.logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="btn btn-sm btn-outline-secondary" type="submit">Sign out</button></form></div>
+    </header>
+    <main class="content-area">
+      {% with messages = get_flashed_messages(with_categories=true) %}{% if messages %}<div class="flash-stack" aria-live="polite">{% for category,message in messages %}<div class="alert alert-{{ 'danger' if category == 'error' else category }} alert-dismissible fade show" role="alert">{{ message }}<button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button></div>{% endfor %}</div>{% endif %}{% endwith %}
+      {% block content %}{% endblock %}
+    </main>
+    <footer class="page-footer">AuraVision Smart Retail Analytics <span>•</span> Secure site monitoring</footer>
+  </div>
+</div>
+<div class="offcanvas offcanvas-start mobile-offcanvas" tabindex="-1" id="mobileNav" aria-labelledby="mobileNavLabel"><div class="offcanvas-header"><a class="brand" href="{{ url_for('dashboard') }}"><span class="brand-mark">A</span><strong id="mobileNavLabel">AuraVision</strong></a><button type="button" class="btn-close btn-close-white" data-bs-dismiss="offcanvas" aria-label="Close"></button></div><div class="offcanvas-body"><nav class="side-nav">
+  <a href="{{ url_for('dashboard') }}" class="nav-link"><span class="nav-icon">▦</span>Overview</a>
+  <a href="{{ url_for('dashboard_pages.live') }}" class="nav-link"><span class="nav-icon">◉</span>Live cameras</a>
+  <a href="{{ url_for('dashboard_pages.incidents') }}" class="nav-link"><span class="nav-icon">⚠</span>Incidents</a>
+  <a href="{{ url_for('dashboard_pages.heatmap') }}" class="nav-link"><span class="nav-icon">◈</span>Heatmap</a>
+  <a href="{{ url_for('dashboard_pages.reports') }}" class="nav-link"><span class="nav-icon">▤</span>Reports</a>
+  {% if current_site and current_site.site_type == 'water_point' %}
+  <a href="{{ url_for('admin.schedule') }}" class="nav-link"><span class="nav-icon">▦</span>Schedule</a>
+  {% endif %}
+  {% if current_user.role in ['admin','hod'] %}
+  <a href="{{ url_for('admin.rules') }}" class="nav-link"><span class="nav-icon">◇</span>Rules engine</a>
+  <a href="{{ url_for('admin.recipients') }}" class="nav-link"><span class="nav-icon">♧</span>Recipients</a>
+  {% endif %}
+  {% if current_user.role == 'admin' %}<a href="{{ url_for('admin.cameras') }}" class="nav-link"><span class="nav-icon">▣</span>Cameras</a>{% endif %}
+</nav></div></div>
+{% else %}
+  {% with messages = get_flashed_messages(with_categories=true) %}{% if messages %}<div class="login-flashes">{% for category,message in messages %}<div class="alert alert-{{ 'danger' if category == 'error' else category }} alert-dismissible fade show" role="alert">{{ message }}<button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button></div>{% endfor %}</div>{% endif %}{% endwith %}
+  {% block public_content %}{% endblock %}
+{% endif %}
+<script src="{{ url_for('static', filename='js/bootstrap.bundle.min.js') }}" defer></script>
+</body></html>
+B.21  Dashboard Page
+File: web/templates/dashboard.html
+{% extends "base.html" %}
+{% block title %}Overview{% endblock %}
+{% block head %}<meta http-equiv="refresh" content="5">
+<style>
+.fc-wrap{overflow-x:auto}.fc-inner{min-width:760px}
+.fc-grid{stroke:#e2e8f0;stroke-width:1}.fc-axis{stroke:#94a3b8;stroke-width:1.2}
+.fc-axis-text{font-size:11px;fill:#475569}.fc-title{font-size:12.5px;font-weight:600;fill:#334155}
+.fc-bar{fill:var(--primary,#4f46e5);transition:opacity .15s}.fc-bar.peak{fill:var(--accent,#f97316)}
+.fc-slot:hover .fc-bar{opacity:.78}.fc-val{font-size:10.5px;font-weight:600;fill:#334155}
+.fc-caption{display:flex;flex-wrap:wrap;gap:1.25rem;margin-top:.5rem;font-size:.9rem;color:#475569}
+.fc-caption i{display:inline-block;width:12px;height:12px;border-radius:3px;margin-right:.4rem;vertical-align:-1px}
+</style>
+{% endblock %}
+{% block content %}
+<section class="page-banner">
+  <div><div class="page-banner-eyebrow">AURAVISION • SITE OVERVIEW</div>
+    <h1>{{ 'Water point monitoring' if is_water else 'Retail analytics overview' }}</h1>
+    <p>{{ 'Live student presence, class-time compliance and gathering violations.' if is_water else 'Understand visitor flow, zone occupancy and store activity at a glance.' }}</p>
+  </div>
+  <div class="banner-meta"><span class="site-type-badge">{{ 'Water point' if is_water else 'Retail' }}</span><span>{{ today|date_display }}</span><span>{{ site.name if site else 'No site selected' }}</span></div>
+</section>
+
+{% if not site %}
+<div class="panel empty-state"><span class="empty-icon">⌂</span><h3>No site selected</h3><p>Add a site in the site configuration to begin viewing analytics.</p></div>
+{% elif is_water %}
+<section class="schedule-status-banner {{ 'restricted' if restricted else ('allowed' if current_period == 'Break' else 'outside') }}">
+  <span class="schedule-status-icon">{{ '!' if restricted else ('✓' if current_period == 'Break' else '◷') }}</span>
+  <div><strong>{% if restricted %}Right now: Class period - gathering not allowed{% elif current_period == 'Break' %}Right now: Break - allowed{% else %}Right now: Outside college hours{% endif %}</strong>
+    <p>{% if restricted %}Gathering at the water point is restricted during this class period.{% elif current_period == 'Break' %}Students may gather during this scheduled break.{% else %}No class or break schedule is currently active.{% endif %}</p>
+  </div><span class="schedule-state-label">{{ current_period }}</span>
+</section>
+<div class="kpi-grid">
+  <a class="kpi-card" href="{{ url_for('dashboard_pages.live') }}"><div class="kpi-top"><span class="kpi-icon icon-blue">♙</span><span class="kpi-trend">LIVE</span></div><div class="kpi-number">{{ people_now }}</div><div class="kpi-label">Students present</div><span class="kpi-accent accent-blue"></span></a>
+  <a class="kpi-card" href="{{ url_for('admin.schedule') }}"><div class="kpi-top"><span class="kpi-icon icon-amber">◷</span><span class="kpi-trend">NOW</span></div><div class="kpi-number kpi-number-text">{{ current_period }}</div><div class="kpi-label">Current period</div><span class="kpi-accent accent-amber"></span></a>
+  <a class="kpi-card" href="{{ url_for('dashboard_pages.incidents') }}"><div class="kpi-top"><span class="kpi-icon icon-red">!</span><span class="kpi-trend">TODAY</span></div><div class="kpi-number">{{ violations_today }}</div><div class="kpi-label">Violations</div><span class="kpi-accent accent-red"></span></a>
+  <a class="kpi-card" href="{{ url_for('dashboard_pages.incidents') }}"><div class="kpi-top"><span class="kpi-icon icon-pink">⌛</span><span class="kpi-trend">TODAY</span></div><div class="kpi-number">{{ longest_gathering|duration }}</div><div class="kpi-label">Longest gathering today</div><span class="kpi-accent accent-pink"></span></a>
+  <a class="kpi-card" href="{{ url_for('dashboard_pages.incidents') }}"><div class="kpi-top"><span class="kpi-icon icon-teal">↗</span><span class="kpi-trend">TODAY</span></div><div class="kpi-number">{{ peak_count_today }}</div><div class="kpi-label">Peak count today</div><span class="kpi-accent accent-teal"></span></a>
+  <a class="kpi-card" href="{{ url_for('admin.schedule') }}"><div class="kpi-top"><span class="kpi-icon icon-green">✓</span><span class="kpi-trend">TODAY</span></div><div class="kpi-number">{{ compliance_pct }}%</div><div class="kpi-label">Class-time compliance</div><span class="kpi-accent accent-green"></span></a>
+</div>
+
+<div class="panel">
+  <div class="panel-heading"><div><h2>Camera and floor status</h2><p>Latest detected people count and worker freshness for each camera.</p></div><a class="btn btn-outline-primary" href="{{ url_for('dashboard_pages.live') }}">Open live cameras</a></div>
+  {% if camera_tiles %}
+  <div class="camera-tile-grid">
+    {% for camera in camera_tiles %}
+    <article class="camera-tile">
+      <div class="camera-tile-head"><div><strong>{{ camera.name }}</strong><span>{{ camera.floor_label or 'Floor not labelled' }}</span></div>
+        {% if not camera.online %}<span class="status-badge violation">Violation • Offline</span>{% elif camera.people_count > 0 and restricted %}<span class="status-badge violation">Violation</span>{% else %}<span class="status-badge normal">OK • Online</span>{% endif %}
+      </div>
+      <div class="camera-count"><strong>{{ camera.people_count }}</strong><span>Students present</span></div>
+      <div class="camera-update">Last update: {{ camera.last_update|time_display if camera.last_update else 'No observations yet' }}</div>
+      {% if not camera.online %}<div class="offline-note"><strong>Worker offline for this camera</strong><code>{{ camera.command }}</code><span class="small">Command above is selectable.</span></div>{% endif %}
+    </article>
+    {% endfor %}
+  </div>
+  {% else %}<div class="table-empty"><span class="empty-icon">▣</span><strong>No cameras configured</strong><span>Add a camera to start monitoring student presence.</span></div>{% endif %}
+</div>
+
+<div class="dashboard-grid">
+  <section class="panel">
+    <div class="panel-heading"><div><h2>Hourly student presence and violations</h2><p>All 24 hours shown. Scheduled class and break start hours are marked.</p></div></div>
+    {% if hourly %}
+    <div class="hour-chart" role="img" aria-label="Hourly crossing counts">
+      {% for item in hourly %}
+      <div class="hour-column" title="{{ '%02d'|format(item.hour) }}:00 — {{ item.total }} events">
+        <div class="hour-bar-wrap"><div class="hour-bar {{ 'class-hour' if item.hour in class_hours else ('break-hour' if item.hour in break_hours else '') }}" style="height:{{ ((item.total / max_hourly) * 130)|int if max_hourly else 2 }}px"></div></div>
+        <span>{{ '%02d'|format(item.hour) }}</span>
+      </div>{% endfor %}
+    </div>
+    <div class="chart-legend"><span><i class="legend-class"></i>Class hour</span><span><i class="legend-break"></i>Break hour</span><span><i class="legend-neutral"></i>Other hours</span></div>
+    {% else %}<div class="table-empty"><strong>No hourly data yet</strong><span>Counts will appear after camera observations are recorded.</span></div>{% endif %}
+  </section>
+  <section class="panel">
+    <div class="panel-heading"><div><h2>Recent violations</h2><p>Latest gathering incidents for this site.</p></div><a class="btn btn-outline-primary" href="{{ url_for('dashboard_pages.incidents') }}">View all</a></div>
+    {% if recent_incidents %}
+    <div class="recent-list">{% for incident in recent_incidents if incident.rule_type == 'restricted_presence' %}
+      <div class="recent-item"><span class="recent-marker violation-marker">!</span><div class="recent-main"><strong>{{ incident.camera_name }}</strong><span>{{ incident.started_at|datetime_display }} • Peak {{ incident.peak_count }}</span></div><span class="status-badge {{ 'violation' if incident.status == 'open' else 'normal' }}">{{ incident.status|title }}</span></div>
+    {% else %}<div class="table-empty"><strong>No violations recorded</strong><span>New restricted gatherings will appear here.</span></div>{% endfor %}</div>
+    {% else %}<div class="table-empty"><strong>No violations recorded</strong><span>New restricted gatherings will appear here.</span></div>{% endif %}
+  </section>
+</div>
+<section class="panel last-alert-panel"><div class="panel-heading"><div><h2>Last alert status</h2><p>Most recent notification attempt for this site.</p></div></div>
+  {% if last_alert %}<div class="alert-status-line"><span class="status-badge {{ 'normal' if last_alert.status == 'sent' else ('violation' if last_alert.status == 'failed' else 'busy') }}">{{ last_alert.status|title }}</span><strong>{{ last_alert.recipient_name }}</strong><span>{{ last_alert.sent_at|datetime_display if last_alert.sent_at else 'Time unavailable' }}</span>{% if last_alert.error_msg %}<small>{{ last_alert.error_msg }}</small>{% endif %}</div>
+  {% else %}<div class="table-empty"><strong>No alerts yet</strong><span>Notification status will appear here after the first alert is queued.</span></div>{% endif %}
+</section>
+
+{% else %}
+<div class="kpi-grid">
+  <a class="kpi-card" href="{{ url_for('dashboard_pages.live') }}"><div class="kpi-top"><span class="kpi-icon icon-blue">♙</span><span class="kpi-trend">LIVE</span></div><div class="kpi-number">{{ people_now }}</div><div class="kpi-label">Visitors now</div><span class="kpi-accent accent-blue"></span></a>
+  <a class="kpi-card" href="{{ url_for('dashboard_pages.reports') }}"><div class="kpi-top"><span class="kpi-icon icon-green">↘</span><span class="kpi-trend">TODAY</span></div><div class="kpi-number">{{ entries_today }}</div><div class="kpi-label">Entries today</div><span class="kpi-accent accent-green"></span></a>
+  <a class="kpi-card" href="{{ url_for('dashboard_pages.reports') }}"><div class="kpi-top"><span class="kpi-icon icon-amber">↗</span><span class="kpi-trend">TODAY</span></div><div class="kpi-number">{{ exits_today }}</div><div class="kpi-label">Exits today</div><span class="kpi-accent accent-amber"></span></a>
+  <a class="kpi-card" href="{{ url_for('dashboard_pages.reports') }}"><div class="kpi-top"><span class="kpi-icon icon-teal">♙</span><span class="kpi-trend">NET</span></div><div class="kpi-number">{{ entries_today - exits_today }}</div><div class="kpi-label">Net inside</div><span class="kpi-accent accent-teal"></span></a>
+  <a class="kpi-card" href="{{ url_for('dashboard_pages.reports') }}"><div class="kpi-top"><span class="kpi-icon icon-pink">⌛</span><span class="kpi-trend">TODAY</span></div><div class="kpi-number">{{ avg_dwell|duration }}</div><div class="kpi-label">Average dwell</div><span class="kpi-accent accent-pink"></span></a>
+  <a class="kpi-card" href="{{ url_for('dashboard_pages.reports') }}"><div class="kpi-top"><span class="kpi-icon icon-red">◷</span><span class="kpi-trend">TODAY</span></div><div class="kpi-number">{{ '%02d:00'|format(busiest_hour) if busiest_hour is not none else '—' }}</div><div class="kpi-label">Busiest hour</div><span class="kpi-accent accent-red"></span></a>
+</div>
+
+{# ---------- Hourly footfall: labelled SVG chart (all 24 hours) ---------- #}
+{% set totals = {} %}
+{% for item in hourly %}{% set _ = totals.update({(item.hour|int): (item.total|int)}) %}{% endfor %}
+{% set ns = namespace(peak=0, peak_hour=0, total=0) %}
+{% for h in range(24) %}{% set v = totals.get(h, 0) %}{% set ns.total = ns.total + v %}{% if v > ns.peak %}{% set ns.peak = v %}{% set ns.peak_hour = h %}{% endif %}{% endfor %}
+{% set peak = ns.peak %}
+{% set step = 1 if peak <= 5 else (2 if peak <= 10 else (5 if peak <= 25 else (10 if peak <= 50 else (20 if peak <= 100 else (50 if peak <= 250 else 100))))) %}
+{% set top = (((peak / step)|round(0, 'ceil')|int) * step) if peak > 0 else step %}
+{% set ticks = top // step %}
+{% set W = 960 %}{% set H = 380 %}{% set ml = 72 %}{% set mr = 16 %}{% set mt = 30 %}{% set mb = 72 %}
+{% set pw = W - ml - mr %}{% set ph = H - mt - mb %}{% set slot = pw / 24 %}{% set bw = 22 %}
+
+<section class="panel">
+  <div class="panel-heading"><div><h2>Hourly footfall</h2><p>People crossing the entrance line in each hour of today (entries plus exits). Hover over an hour for its exact count.</p></div></div>
+  {% if peak > 0 %}
+  <div class="fc-wrap"><div class="fc-inner">
+    <svg viewBox="0 0 {{ W }} {{ H }}" width="100%" role="img" aria-label="Bar chart of people crossing per hour of the day">
+      {% for i in range(0, ticks + 1) %}{% set val = i * step %}{% set gy = mt + ph - (val / top * ph) %}
+      <line class="fc-grid" x1="{{ ml }}" x2="{{ ml + pw }}" y1="{{ '%.1f'|format(gy) }}" y2="{{ '%.1f'|format(gy) }}"/>
+      <text class="fc-axis-text" x="{{ ml - 10 }}" y="{{ '%.1f'|format(gy + 4) }}" text-anchor="end">{{ val }}</text>
+      {% endfor %}
+      <line class="fc-axis" x1="{{ ml }}" y1="{{ mt }}" x2="{{ ml }}" y2="{{ mt + ph }}"/>
+      <line class="fc-axis" x1="{{ ml }}" y1="{{ mt + ph }}" x2="{{ ml + pw }}" y2="{{ mt + ph }}"/>
+      {% for h in range(24) %}{% set v = totals.get(h, 0) %}
+      {% set bh = (v / top * ph) if v > 0 else 0 %}
+      {% set sx = ml + h * slot %}
+      {% set bx = sx + (slot - bw) / 2 %}
+      {% set by = mt + ph - bh %}
+      <g class="fc-slot">
+        <title>{{ '%02d'|format(h) }}:00 to {{ '%02d'|format((h + 1) % 24) }}:00 — {{ v }} crossing{{ '' if v == 1 else 's' }}</title>
+        <rect x="{{ '%.1f'|format(sx) }}" y="{{ mt }}" width="{{ '%.1f'|format(slot) }}" height="{{ ph }}" fill="transparent"/>
+        {% if v > 0 %}
+        <rect class="fc-bar{% if h == ns.peak_hour %} peak{% endif %}" x="{{ '%.1f'|format(bx) }}" y="{{ '%.1f'|format(by) }}" width="{{ bw }}" height="{{ '%.1f'|format(bh) }}" rx="3"/>
+        <text class="fc-val" x="{{ '%.1f'|format(bx + bw / 2) }}" y="{{ '%.1f'|format(by - 5) }}" text-anchor="middle">{{ v }}</text>
+        {% endif %}
+      </g>
+      <text class="fc-axis-text" x="{{ '%.1f'|format(sx + slot / 2) }}" y="{{ mt + ph + 18 }}" text-anchor="middle">{{ '%02d'|format(h) }}:00</text>
+      {% endfor %}
+      <text class="fc-title" x="{{ ml + pw / 2 }}" y="{{ H - 14 }}" text-anchor="middle">Time of day (hour, 24-hour clock)</text>
+      <text class="fc-title" transform="translate(16 {{ mt + ph / 2 }}) rotate(-90)" text-anchor="middle">Count (people crossing)</text>
+    </svg>
+  </div></div>
+  <div class="fc-caption">
+    <span><i style="background:var(--accent,#f97316)"></i>Busiest hour: {{ '%02d'|format(ns.peak_hour) }}:00 to {{ '%02d'|format((ns.peak_hour + 1) % 24) }}:00 ({{ peak }} crossings)</span>
+    <span><i style="background:var(--primary,#4f46e5)"></i>Other hours</span>
+    <span>Total today: {{ ns.total }} crossings</span>
+  </div>
+  {% else %}<div class="table-empty"><strong>No activity recorded today</strong><span>Hourly footfall appears when the worker records crossings.</span></div>{% endif %}
+</section>
+
+<section class="panel">
+  <div class="panel-heading"><div><h2>Recent occupancy incidents</h2><p>Latest rule-triggered events.</p></div><a class="btn btn-outline-primary" href="{{ url_for('dashboard_pages.incidents') }}">View all</a></div>
+  {% if recent_incidents %}<div class="recent-list">{% for incident in recent_incidents %}
+    <div class="recent-item"><span class="recent-marker {{ 'violation-marker' if incident.status == 'open' else 'normal-marker' }}">{{ '!' if incident.status == 'open' else '✓' }}</span><div class="recent-main"><strong>{{ incident.camera_name }}</strong><span>{{ incident.started_at|datetime_display }} • {{ incident.rule_type|replace('_',' ')|title }}</span></div><span class="status-badge {{ 'violation' if incident.status == 'open' else 'normal' }}">{{ incident.status|title }}</span></div>
+  {% endfor %}</div>{% else %}<div class="table-empty"><strong>No incidents found</strong><span>Occupancy incidents will appear here when a rule is triggered.</span></div>{% endif %}
+</section>
+{% endif %}
+{% endblock %}
+B.22  Live View Page
