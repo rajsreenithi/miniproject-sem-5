@@ -1,0 +1,216 @@
+from datetime import date, datetime, timedelta
+import os
+from flask import Flask, abort, flash, redirect, render_template, request, session, url_for
+from web.auth import (clear_login_failures, csrf_token, login_locked, record_login_failure,
+                      validate_csrf, verify_login)
+from web.db_helpers import fetch_all, fetch_one
+from web.routes_admin import admin_bp, selected_site
+from web.routes_dashboard import dashboard_bp
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+app = Flask(__name__,template_folder="web/templates",static_folder="web/static")
+import os
+
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY")
+
+if not app.config["SECRET_KEY"]:
+    raise RuntimeError(
+        "SECRET_KEY is not configured. Set it before starting AuraVision."
+    )
+SECRET_KEY=os.getenv("FLASK_SECRET_KEY", "CHANGE-THIS-TO-A-LONG-RANDOM-SECRET"),
+SESSION_COOKIE_HTTPONLY=True,
+SESSION_COOKIE_SAMESITE="Lax",
+SESSION_COOKIE_SECURE=os.getenv("COOKIE_SECURE", "0") == "1",
+PERMANENT_SESSION_LIFETIME=timedelta(hours=8),
+
+def _duration_filter(seconds):
+    try:
+        total = max(0, int(seconds or 0))
+    except (TypeError, ValueError):
+        total = 0
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m" if minutes else f"{hours}h"
+    if minutes:
+        return f"{minutes}m {secs}s" if secs else f"{minutes}m"
+    return f"{secs}s"
+
+
+def _parse_datetime(value):
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date):
+        return datetime.combine(value, datetime.min.time())
+    try:
+        return datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _date_display(value):
+    parsed = _parse_datetime(value)
+    return parsed.strftime("%d %b %Y") if parsed else (str(value) if value else "—")
+
+
+def _time_display(value):
+    parsed = _parse_datetime(value)
+    if parsed:
+        return parsed.strftime("%H:%M")
+    if value:
+        try:
+            return str(value)[:5]
+        except Exception:
+            pass
+    return "—"
+
+
+def _datetime_display(value):
+    parsed = _parse_datetime(value)
+    return parsed.strftime("%d %b %Y, %H:%M") if parsed else (str(value) if value else "—")
+
+
+app.jinja_env.filters["duration"] = _duration_filter
+app.jinja_env.filters["date_display"] = _date_display
+app.jinja_env.filters["time_display"] = _time_display
+app.jinja_env.filters["datetime_display"] = _datetime_display
+app.jinja_env.globals["csrf_token"] = csrf_token
+app.register_blueprint(admin_bp)
+
+app.register_blueprint(dashboard_bp)
+@app.before_request
+def protect_post_forms():
+    if request.method == "POST":
+        validate_csrf()
+
+
+@app.context_processor
+def inject_layout_context():
+    user = session.get("user")
+    try:
+        sites, site = selected_site()
+    except Exception:
+        sites, site = [], None
+    site_type = site.get("site_type") if site else "retail"
+    labels = {"people_label": "Customers" if site_type == "retail" else "Students present",
+              "incident_label": "Footfall" if site_type == "retail" else "Violations"}
+    live_dir = os.path.join(BASE_DIR, "data", "live")
+    now_ts = __import__("time").time()
+    worker_online = False
+    try:
+        camera_rows = fetch_all(
+            "SELECT camera_id FROM cameras WHERE site_id = %s AND is_active = %s",
+            (site["site_id"], 1),
+        ) if site else []
+        worker_online = any(
+            os.path.isfile(os.path.join(live_dir, f"camera_{row['camera_id']}.jpg"))
+            and now_ts - os.path.getmtime(os.path.join(live_dir, f"camera_{row['camera_id']}.jpg")) <= 30
+            for row in camera_rows
+        )
+    except (OSError, Exception):
+        worker_online = False
+    return {"current_user": user, "layout_sites": sites, "current_site": site,
+            "worker_online": worker_online, **labels}
+
+
+@app.route("/")
+def index():
+    if not session.get("user"):
+        return redirect(url_for("auth.login"))
+    return redirect(url_for("dashboard"))
+
+
+from flask import Blueprint
+from web.auth import login_required
+
+auth_bp = Blueprint("auth", __name__, url_prefix="/auth")
+
+
+@auth_bp.route("/login", methods=["GET", "POST"])
+def login():
+    if session.get("user"):
+        return redirect(url_for("dashboard"))
+    if request.method == "POST":
+        locked, seconds = login_locked()
+        if locked:
+            flash(f"Too many failed attempts. Try again in about {seconds} seconds.", "danger")
+            return render_template("login.html"), 429
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+        if not username or not password:
+            record_login_failure()
+            flash("Enter both username and password.", "danger")
+            return render_template("login.html"), 400
+        try:
+            user = verify_login(username, password)
+        except Exception:
+            app.logger.exception("Login database operation failed")
+            flash("Sign-in is temporarily unavailable. Check the database connection.", "danger")
+            return render_template("login.html"), 503
+        if not user:
+            record_login_failure()
+            flash("Incorrect username or password.", "danger")
+            return render_template("login.html"), 401
+        clear_login_failures()
+        session.clear()
+        session["user"] = user
+        session.permanent = True
+        session["csrf_token"] = csrf_token()
+        next_path = request.args.get("next", "")
+        if not next_path.startswith("/") or next_path.startswith("//"):
+            next_path = url_for("dashboard")
+        return redirect(next_path)
+    return render_template("login.html")
+
+
+@auth_bp.route("/logout", methods=["POST"])
+@login_required
+def logout():
+    session.clear()
+    flash("You have been signed out.", "success")
+    return redirect(url_for("auth.login"))
+
+
+app.register_blueprint(auth_bp)
+
+
+@app.route("/dashboard")
+@login_required
+def dashboard():
+    try:
+        sites, site = selected_site()
+        if not site:
+            return render_template("dashboard.html", sites=sites, site=None, kpis={"cameras": 0, "active": 0, "rules": 0, "open": 0})
+        site_id = site["site_id"]
+        kpis = {
+            "cameras": fetch_one("SELECT COUNT(*) AS n FROM cameras WHERE site_id=%s", (site_id,))["n"],
+            "active": fetch_one("SELECT COUNT(*) AS n FROM cameras WHERE site_id=%s AND is_active=1", (site_id,))["n"],
+            "rules": fetch_one("SELECT COUNT(*) AS n FROM rules WHERE site_id=%s AND is_active=1", (site_id,))["n"],
+            "open": fetch_one("SELECT COUNT(*) AS n FROM incidents i JOIN cameras c ON c.camera_id=i.camera_id WHERE c.site_id=%s AND i.status='open'", (site_id,))["n"],
+        }
+        incidents = fetch_all("SELECT i.incident_id,i.started_at,i.peak_count,i.status,c.name AS camera_name,c.floor_label FROM incidents i JOIN cameras c ON c.camera_id=i.camera_id WHERE c.site_id=%s ORDER BY i.started_at DESC LIMIT 8", (site_id,))
+    except Exception:
+        app.logger.exception("Dashboard query failed")
+        flash("Could not load dashboard data. Confirm the database is running and schema is installed.", "danger")
+        sites, site, kpis, incidents = [], None, {"cameras": 0, "active": 0, "rules": 0, "open": 0}, []
+    return render_template("dashboard.html", sites=sites, site=site, kpis=kpis, incidents=incidents)
+
+
+@app.errorhandler(400)
+def bad_request(error):
+    return render_template("404.html", code=400, message=getattr(error, "description", "The request could not be processed.")), 400
+
+
+@app.errorhandler(403)
+def forbidden(error):
+    return render_template("404.html", code=403, message="You do not have permission to view this page."), 403
+
+
+@app.errorhandler(404)
+def not_found(error):
+    return render_template("404.html", code=404, message="The page you are looking for does not exist."), 404
+
+
+if __name__ == "__main__":
+    app.run(host=os.getenv("FLASK_HOST", "127.0.0.1"), port=int(os.getenv("FLASK_PORT", "5000")), debug=os.getenv("FLASK_DEBUG", "0") == "1")
