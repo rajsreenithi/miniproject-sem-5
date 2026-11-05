@@ -1,0 +1,208 @@
+from dataclasses import dataclass
+from typing import TypeAlias
+
+
+Point: TypeAlias = tuple[float, float]
+BoundingBox: TypeAlias = tuple[int, int, int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class Track:
+    """A tracked person in a single video frame."""
+
+    track_id: int
+    bbox: BoundingBox
+    foot_point: Point
+    confidence: float
+
+    def __post_init__(self) -> None:
+        """Validate the track's basic numeric values."""
+        if self.track_id < 0:
+            raise ValueError("track_id must be non-negative")
+
+        if not 0.0 <= self.confidence <= 1.0:
+            raise ValueError("confidence must be between 0 and 1")
+
+        x1, y1, x2, y2 = self.bbox
+
+        if x2 < x1 or y2 < y1:
+            raise ValueError("Invalid bounding box coordinates")
+B.5  Zone Monitor
+File: engine/zones.py
+"""Polygon-based zone presence and dwell-time monitoring."""
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Mapping, Sequence
+
+from engine.tracker import Point, Track
+
+
+Polygon = Sequence[Point]
+
+
+@dataclass(frozen=True, slots=True)
+class Visit:
+    """A completed visit to a monitored zone."""
+
+    zone_id: int
+    track_id: int
+    entered_at: datetime
+    left_at: datetime
+    dwell_sec: int
+
+
+@dataclass(slots=True)
+class _ActiveVisit:
+    """Internal state for a visit that has not yet finished."""
+
+    entered_at: datetime
+    outside_since: datetime | None = None
+
+
+class ZoneMonitor:
+    """Monitor person presence and dwell time in polygonal zones."""
+
+    def __init__(
+        self,
+        zones: Mapping[int, Polygon],
+        grace_sec: float = 2.0,
+    ) -> None:
+        """Initialize zone polygons and the outside grace period."""
+        if grace_sec < 0:
+            raise ValueError("grace_sec cannot be negative")
+
+        self.zones: dict[int, tuple[Point, ...]] = {}
+
+        for zone_id, polygon in zones.items():
+            points = tuple(
+                (float(point[0]), float(point[1]))
+                for point in polygon
+            )
+
+            if len(points) < 3:
+                raise ValueError(
+                    f"Zone {zone_id} must have at least 3 vertices"
+                )
+
+            self.zones[int(zone_id)] = points
+
+        self.grace_period = timedelta(seconds=grace_sec)
+        self._active: dict[tuple[int, int], _ActiveVisit] = {}
+
+    @staticmethod
+    def _point_in_polygon(point: Point, polygon: Polygon) -> bool:
+        """Return whether a point is inside or on a polygon boundary."""
+        px, py = point
+        inside = False
+        count = len(polygon)
+
+        for index in range(count):
+            x1, y1 = polygon[index]
+            x2, y2 = polygon[(index + 1) % count]
+
+            cross = (
+                (px - x1) * (y2 - y1)
+                - (py - y1) * (x2 - x1)
+            )
+
+            if (
+                abs(cross) < 1e-9
+                and min(x1, x2) - 1e-9 <= px <= max(x1, x2) + 1e-9
+                and min(y1, y2) - 1e-9 <= py <= max(y1, y2) + 1e-9
+            ):
+                return True
+
+            intersects = (y1 > py) != (y2 > py)
+
+            if intersects:
+                intersection_x = (
+                    x1 + (py - y1) * (x2 - x1) / (y2 - y1)
+                )
+
+                if px < intersection_x:
+                    inside = not inside
+
+        return inside
+
+    def update(
+        self,
+        tracks: Sequence[Track],
+        now: datetime,
+    ) -> tuple[dict[int, int], list[Visit]]:
+        """Update presence counts and return visits that have finished."""
+        observed_inside: set[tuple[int, int]] = set()
+
+        for zone_id, polygon in self.zones.items():
+            for track in tracks:
+                if self._point_in_polygon(track.foot_point, polygon):
+                    observed_inside.add((zone_id, track.track_id))
+
+        finished_visits: list[Visit] = []
+
+        # Start new visits and cancel pending exits when people return.
+        for key in observed_inside:
+            if key not in self._active:
+                self._active[key] = _ActiveVisit(entered_at=now)
+            else:
+                self._active[key].outside_since = None
+
+        # Start or complete exits for active visits.
+        for key, state in list(self._active.items()):
+            if key in observed_inside:
+                continue
+
+            if state.outside_since is None:
+                state.outside_since = now
+
+            outside_duration = now - state.outside_since
+
+            if outside_duration >= self.grace_period:
+                zone_id, track_id = key
+                left_at = state.outside_since
+                dwell_sec = max(
+                    0,
+                    int((left_at - state.entered_at).total_seconds()),
+                )
+
+                finished_visits.append(
+                    Visit(
+                        zone_id=zone_id,
+                        track_id=track_id,
+                        entered_at=state.entered_at,
+                        left_at=left_at,
+                        dwell_sec=dwell_sec,
+                    )
+                )
+
+                del self._active[key]
+
+        # A pending exit remains present until the grace period expires.
+        current_counts = {
+            zone_id: sum(
+                1
+                for active_zone, _ in self._active
+                if active_zone == zone_id
+            )
+            for zone_id in self.zones
+        }
+
+        return current_counts, finished_visits
+    
+    def current_dwell(
+        self,
+        now: datetime,
+    ) -> dict[tuple[int, int], float]:
+        """Return current dwell seconds keyed by (zone_id, track_id)."""
+        return {
+            (zone_id, track_id): max(
+                0.0,
+                (now - state.entered_at).total_seconds(),
+            )
+            for (zone_id, track_id), state in self._active.items()
+        }
+
+    
+    def reset(self) -> None:
+        """Clear all active visits, for example when starting a new video."""
+        self._active.clear()
