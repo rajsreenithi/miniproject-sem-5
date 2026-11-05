@@ -1,0 +1,231 @@
+File: engine/linecount.py
+"""Directional line-crossing detection using track foot points."""
+
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Mapping, Sequence
+
+from engine.tracker import Point, Track
+
+
+Line = tuple[Point, Point]
+
+
+@dataclass(frozen=True, slots=True)
+class Crossing:
+    """A detected crossing of a counting line."""
+
+    line_id: int
+    track_id: int
+    direction: str
+    ts: datetime
+
+
+class LineCounter:
+    """Detect directional crossings for persistent person track IDs."""
+
+    def __init__(
+        self,
+        lines: Mapping[int, Line],
+        epsilon: float = 1e-6,
+    ) -> None:
+        """Initialize directed lines and the side-change tolerance."""
+        if epsilon < 0:
+            raise ValueError("epsilon cannot be negative")
+
+        self.lines: dict[int, Line] = {
+            int(line_id): (
+                (float(endpoints[0][0]), float(endpoints[0][1])),
+                (float(endpoints[1][0]), float(endpoints[1][1])),
+            )
+            for line_id, endpoints in lines.items()
+        }
+
+        for line_id, (start, end) in self.lines.items():
+            if start == end:
+                raise ValueError(f"Line {line_id} has zero length")
+
+        self.epsilon = epsilon
+        self._last_side: dict[tuple[int, int], int] = {}
+
+    @staticmethod
+    def _cross_product(
+        start: Point,
+        end: Point,
+        point: Point,
+    ) -> float:
+        """Return the signed cross product relative to a directed line."""
+        return (
+            (end[0] - start[0]) * (point[1] - start[1])
+            - (end[1] - start[1]) * (point[0] - start[0])
+        )
+
+    def update(
+        self,
+        tracks: Sequence[Track],
+        now: datetime,
+    ) -> list[Crossing]:
+        """Return crossings observed between the previous and current frames."""
+        crossings: list[Crossing] = []
+
+        for track in tracks:
+            for line_id, (start, end) in self.lines.items():
+                value = self._cross_product(
+                    start,
+                    end,
+                    track.foot_point,
+                )
+
+                if abs(value) <= self.epsilon:
+                    # Keep the last non-zero side while the point is on
+                    # the line, preventing repeated counts on its boundary.
+                    continue
+
+                current_side = 1 if value > 0 else -1
+                key = (line_id, track.track_id)
+                previous_side = self._last_side.get(key)
+
+                if previous_side is not None and current_side != previous_side:
+                    direction = (
+                        "in"
+                        if previous_side == -1 and current_side == 1
+                        else "out"
+                    )
+
+                    crossings.append(
+                        Crossing(
+                            line_id=line_id,
+                            track_id=track.track_id,
+                            direction=direction,
+                            ts=now,
+                        )
+                    )
+
+                self._last_side[key] = current_side
+
+        return crossings
+
+    def reset(self) -> None:
+        """Clear side history before processing an independent video."""
+        self._last_side.clear()
+B.7  Heatmap Generator
+File: engine/heatmap.py
+"""Foot-point heatmap accumulation and rendering."""
+
+from pathlib import Path
+from typing import Sequence
+
+import cv2
+import numpy as np
+from numpy.typing import NDArray
+
+from engine.tracker import Track
+
+
+Image = NDArray[np.uint8]
+
+
+class HeatmapAccumulator:
+    """Accumulate person foot-point locations into a heatmap."""
+
+    def __init__(
+        self,
+        width: int,
+        height: int,
+        blur_kernel: int = 51,
+        sigma: float = 0.0,
+        alpha: float = 0.45,
+    ) -> None:
+        """Create an empty heatmap for a fixed frame resolution."""
+        if width <= 0 or height <= 0:
+            raise ValueError("width and height must be positive")
+
+        if blur_kernel <= 0 or blur_kernel % 2 == 0:
+            raise ValueError("blur_kernel must be a positive odd number")
+
+        if sigma < 0:
+            raise ValueError("sigma cannot be negative")
+
+        if not 0.0 <= alpha <= 1.0:
+            raise ValueError("alpha must be between 0 and 1")
+
+        self.width = width
+        self.height = height
+        self.blur_kernel = blur_kernel
+        self.sigma = sigma
+        self.alpha = alpha
+        self._accumulator = np.zeros(
+            (height, width),
+            dtype=np.float32,
+        )
+
+    def update(self, tracks: Sequence[Track]) -> None:
+        """Add one contribution for each valid foot point in a frame."""
+        for track in tracks:
+            x = int(round(track.foot_point[0]))
+            y = int(round(track.foot_point[1]))
+
+            if 0 <= x < self.width and 0 <= y < self.height:
+                self._accumulator[y, x] += 1.0
+
+    def _colored_heatmap(self) -> Image:
+        """Return a normalized, Gaussian-blurred, colored heatmap."""
+        blurred = cv2.GaussianBlur(
+            self._accumulator,
+            (self.blur_kernel, self.blur_kernel),
+            self.sigma,
+        )
+
+        maximum = float(blurred.max())
+
+        if maximum <= 0.0:
+            normalized = np.zeros(
+                (self.height, self.width),
+                dtype=np.uint8,
+            )
+        else:
+            normalized = np.clip(
+                blurred * (255.0 / maximum),
+                0,
+                255,
+            ).astype(np.uint8)
+
+        return cv2.applyColorMap(normalized, cv2.COLORMAP_JET)
+
+    def render(self, background_frame: Image) -> Image:
+        """Blend the heatmap with a BGR background frame."""
+        if background_frame is None or background_frame.size == 0:
+            raise ValueError("background_frame must not be empty")
+
+        if background_frame.shape[:2] != (self.height, self.width):
+            raise ValueError("Background dimensions do not match heatmap")
+
+        if background_frame.ndim != 3 or background_frame.shape[2] != 3:
+            raise ValueError("background_frame must be a BGR color image")
+
+        heatmap = self._colored_heatmap()
+
+        if float(self._accumulator.max()) <= 0.0:
+            return background_frame.copy()
+
+        return cv2.addWeighted(
+            background_frame,
+            1.0 - self.alpha,
+            heatmap,
+            self.alpha,
+            0.0,
+        )
+
+    def save_png(self, path: str | Path) -> None:
+        """Save the standalone colored heatmap as a PNG image."""
+        destination = Path(path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+
+        image = self._colored_heatmap()
+
+        if not cv2.imwrite(str(destination), image):
+            raise OSError(f"Could not save heatmap to {destination}")
+
+    def reset(self) -> None:
+        """Clear accumulated foot-point counts."""
+        self._accumulator.fill(0.0)
