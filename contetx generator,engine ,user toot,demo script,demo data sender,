@@ -1,0 +1,620 @@
+Tools (tools/)
+B.32  Alert Dispatcher
+File: tools/run_dispatcher.py
+"""Send pending alerts to the HOD (Telegram or email) and record the outcome."""
+import os
+import smtplib
+import ssl
+import time
+import urllib.parse
+import urllib.request
+from email.message import EmailMessage
+
+import pymysql
+from dotenv import load_dotenv
+
+load_dotenv()
+
+POLL_SECONDS = 10
+
+QUERY = """
+SELECT a.alert_id, r.channel, r.address, i.started_at, i.peak_count,
+       c.name AS camera_name, c.floor_label, s.name AS site_name, s.site_type
+FROM alerts a
+JOIN recipients r ON r.recipient_id = a.recipient_id
+JOIN incidents i ON i.incident_id = a.incident_id
+JOIN cameras c ON c.camera_id = i.camera_id
+JOIN sites s ON s.site_id = c.site_id
+WHERE a.status = 'pending'
+ORDER BY a.alert_id
+LIMIT 20
+"""
+
+
+def connect():
+    return pymysql.connect(
+        host=os.getenv("DB_HOST", "localhost"),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD", ""),
+        database=os.getenv("DB_NAME", "auravision"),
+        cursorclass=pymysql.cursors.DictCursor,
+        autocommit=True,
+    )
+
+
+def build_message(row):
+    place = row["floor_label"] or row["camera_name"]
+    when = row["started_at"].strftime("%d %b %Y, %H:%M:%S")
+    if row["site_type"] == "water_point":
+        return (f"AuraVision alert: people are gathered at the water point "
+                f"({place}) during a restricted period.\n"
+                f"Started: {when}\nPeak count: {row['peak_count']}")
+    return (f"AuraVision alert: occupancy limit exceeded at {row['site_name']} "
+            f"({place}).\nStarted: {when}\nPeak count: {row['peak_count']}")
+
+
+def send_telegram(chat_id, text):
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN missing in .env")
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
+    with urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=15) as resp:
+        if resp.status != 200:
+            raise RuntimeError(f"Telegram returned HTTP {resp.status}")
+
+
+def send_email(address, text):
+    host = os.getenv("SMTP_HOST")
+    if not host:
+        raise RuntimeError("SMTP_HOST missing in .env")
+    port = int(os.getenv("SMTP_PORT", "587"))
+    user = os.getenv("SMTP_USER")
+    msg = EmailMessage()
+    msg["Subject"] = "AuraVision alert"
+    msg["From"] = os.getenv("SMTP_FROM", user)
+    msg["To"] = address
+    msg.set_content(text)
+    with smtplib.SMTP(host, port, timeout=20) as smtp:
+        smtp.starttls(context=ssl.create_default_context())
+        smtp.login(user, os.getenv("SMTP_PASSWORD"))
+        smtp.send_message(msg)
+
+
+def deliver(row):
+    text = build_message(row)
+    if row["channel"] == "telegram":
+        send_telegram(row["address"], text)
+    elif row["channel"] == "email":
+        send_email(row["address"], text)
+    else:
+        raise NotImplementedError("SMS delivery is not enabled (needs DLT registration)")
+
+
+def run_once(conn):
+    with conn.cursor() as cur:
+        cur.execute(QUERY)
+        rows = cur.fetchall()
+        for row in rows:
+            try:
+                deliver(row)
+                status, error = "sent", None
+            except Exception as exc:  # one bad alert must not stop the loop
+                status, error = "failed", str(exc)[:250]
+            cur.execute(
+                "UPDATE alerts SET status=%s, error_msg=%s, sent_at=NOW() WHERE alert_id=%s",
+                (status, error, row["alert_id"]),
+            )
+            print(f"alert {row['alert_id']} -> {status} {error or ''}")
+
+
+def main():
+    conn = None
+    print("Dispatcher running. Ctrl+C to stop.")
+    while True:
+        try:
+            if conn is None:
+                conn = connect()
+            run_once(conn)
+        except Exception as exc:
+            print("Dispatcher error:", exc)
+            conn = None  # reconnect on the next loop
+        time.sleep(POLL_SECONDS)
+
+
+if __name__ == "__main__":
+    main()
+B.33  Create User Tool
+File: tools/create_user.py
+"""Create an AuraVision login user: python tools/create_user.py username admin"""
+from getpass import getpass
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import bcrypt
+from web.db_helpers import db_cursor, fetch_one
+
+
+def main():
+    if len(sys.argv) != 3:
+        print("Usage: python tools/create_user.py <username> <admin|hod|viewer>")
+        raise SystemExit(2)
+    username, role = sys.argv[1].strip(), sys.argv[2].strip().lower()
+    if not username or len(username) > 50:
+        raise SystemExit("Username must be 1–50 characters.")
+    if role not in ("admin", "hod", "viewer"):
+        raise SystemExit("Role must be admin, hod, or viewer.")
+    password = getpass("Password (minimum 12 characters): ")
+    confirm = getpass("Confirm password: ")
+    if len(password) < 12:
+        raise SystemExit("Use a password with at least 12 characters.")
+    if password != confirm:
+        raise SystemExit("Passwords do not match.")
+    if fetch_one("SELECT user_id FROM users WHERE username=%s", (username,)):
+        raise SystemExit("That username already exists.")
+    hashed = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode("utf-8")
+    with db_cursor() as cur:
+        cur.execute("INSERT INTO users (username,password_hash,role) VALUES (%s,%s,%s)", (username, hashed, role))
+    print(f"Created user '{username}' with role '{role}'.")
+
+
+if __name__ == "__main__":
+    main()
+B.34  Demo Data Seeder
+File: tools/seed_demo.py
+
+"""Idempotently seed a demo camera, zone, counting line, and site-specific rule."""
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+from db.connection import get_connection
+
+# Edit these image-pixel coordinates to match your video resolution/scene.
+ZONE_NAME = "Demo Zone"
+ZONE_POINTS = [
+    (250, 150),
+    (950, 150),
+    (950, 650),
+    (250, 650),
+]
+LINE_NAME = "Demo Entry Line"
+COUNT_LINE = (600, 150, 600, 650)  # x1, y1, x2, y2
+FLOOR_LABEL = "Ground"
+
+SITE_CONFIG = {
+    "retail": {
+        "site_name": "Demo Retail Store",
+        "site_type": "retail",
+        "camera_name": "Demo Camera",
+        "rule_type": "occupancy_limit",
+        "min_people": 2,
+        "min_duration_sec": 30,
+        "clear_after_sec": 60,
+        "cooldown_sec": 600,
+    },
+    "water_point": {
+        "site_name": "College Water Point",
+        "site_type": "water_point",
+        "camera_name": "College Water Point Camera",
+        "rule_type": "restricted_presence",
+        "min_people": 2,
+        "min_duration_sec": 30,
+        "clear_after_sec": 60,
+        "cooldown_sec": 600,
+    },
+}
+
+ALL_DAY_START = "00:00:00"
+ALL_DAY_END = "23:59:59"
+
+
+def _ensure_rule(cur, site_id: int, config: dict) -> None:
+    """Create the site's demo rule if missing; ensure it is active."""
+    cur.execute(
+        """SELECT rule_id
+           FROM rules
+           WHERE site_id = %s AND rule_type = %s
+           ORDER BY rule_id
+           LIMIT 1""",
+        (site_id, config["rule_type"]),
+    )
+    rule = cur.fetchone()
+
+    if rule is None:
+        cur.execute(
+            """INSERT INTO rules
+               (site_id, rule_type, min_people, min_duration_sec,
+                clear_after_sec, cooldown_sec, is_active)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+            (
+                site_id,
+                config["rule_type"],
+                config["min_people"],
+                config["min_duration_sec"],
+                config["clear_after_sec"],
+                config["cooldown_sec"],
+                True,
+            ),
+        )
+    else:
+        cur.execute(
+            "UPDATE rules SET is_active = %s WHERE rule_id = %s",
+            (True, int(rule["rule_id"])),
+        )
+
+
+def _ensure_all_day_class_slots(cur, site_id: int) -> None:
+    """Ensure a class slot covers the whole day for each weekday (Monday=1)."""
+    for day_of_week in range(1, 8):
+        cur.execute(
+            """SELECT slot_id
+               FROM schedule_slots
+               WHERE site_id = %s
+                 AND day_of_week = %s
+                 AND start_time = %s
+                 AND end_time = %s
+                 AND slot_type = %s
+               LIMIT 1""",
+            (
+                site_id,
+                day_of_week,
+                ALL_DAY_START,
+                ALL_DAY_END,
+                "class",
+            ),
+        )
+        if cur.fetchone() is None:
+            cur.execute(
+                """INSERT INTO schedule_slots
+                   (site_id, day_of_week, start_time, end_time, slot_type)
+                   VALUES (%s, %s, %s, %s, %s)""",
+                (
+                    site_id,
+                    day_of_week,
+                    ALL_DAY_START,
+                    ALL_DAY_END,
+                    "class",
+                ),
+            )
+
+
+def seed(video_uri: str, site: str = "retail") -> int:
+    """Create missing demo records and return the camera_id.
+
+    Existing matching site, camera, zone, line, and rule records are reused.
+    The water_point profile also gets an active restricted-presence rule and
+    an all-day class slot for every weekday.
+    """
+    if site not in SITE_CONFIG:
+        raise ValueError(
+            f"Unsupported site profile {site!r}. "
+            f"Choose one of: {', '.join(SITE_CONFIG)}"
+        )
+
+    config = SITE_CONFIG[site]
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT site_id FROM sites WHERE name = %s LIMIT 1",
+                (config["site_name"],),
+            )
+            site_row = cur.fetchone()
+
+            if site_row is None:
+                cur.execute(
+                    "INSERT INTO sites (name, site_type) VALUES (%s, %s)",
+                    (config["site_name"], config["site_type"]),
+                )
+                site_id = int(cur.lastrowid)
+            else:
+                site_id = int(site_row["site_id"])
+                # Keep the site's type aligned with the selected profile.
+                cur.execute(
+                    "UPDATE sites SET site_type = %s WHERE site_id = %s",
+                    (config["site_type"], site_id),
+                )
+
+            cur.execute(
+                """SELECT camera_id
+                   FROM cameras
+                   WHERE site_id = %s
+                     AND name = %s
+                     AND source_type = %s
+                     AND source_uri = %s
+                   LIMIT 1""",
+                (site_id, config["camera_name"], "file", video_uri),
+            )
+            camera = cur.fetchone()
+
+            if camera is None:
+                cur.execute(
+                    """INSERT INTO cameras
+                       (site_id, name, floor_label, source_type, source_uri,
+                        frame_stride, is_active)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                    (
+                        site_id,
+                        config["camera_name"],
+                        FLOOR_LABEL,
+                        "file",
+                        video_uri,
+                        2,
+                        True,
+                    ),
+                )
+                camera_id = int(cur.lastrowid)
+            else:
+                camera_id = int(camera["camera_id"])
+
+            cur.execute(
+                "SELECT zone_id FROM zones WHERE camera_id = %s AND name = %s LIMIT 1",
+                (camera_id, ZONE_NAME),
+            )
+            zone = cur.fetchone()
+
+            if zone is None:
+                cur.execute(
+                    "INSERT INTO zones (camera_id, name) VALUES (%s, %s)",
+                    (camera_id, ZONE_NAME),
+                )
+                zone_id = int(cur.lastrowid)
+            else:
+                zone_id = int(zone["zone_id"])
+
+            # Make reruns deterministic: replace this zone's vertices.
+            cur.execute("DELETE FROM zone_points WHERE zone_id = %s", (zone_id,))
+            cur.executemany(
+                """INSERT INTO zone_points (zone_id, seq, x, y)
+                   VALUES (%s, %s, %s, %s)""",
+                [
+                    (zone_id, seq, x, y)
+                    for seq, (x, y) in enumerate(ZONE_POINTS, start=1)
+                ],
+            )
+
+            cur.execute(
+                "SELECT line_id FROM count_lines WHERE camera_id = %s AND name = %s LIMIT 1",
+                (camera_id, LINE_NAME),
+            )
+            line = cur.fetchone()
+            x1, y1, x2, y2 = COUNT_LINE
+
+            if line is None:
+                cur.execute(
+                    """INSERT INTO count_lines
+                       (camera_id, name, x1, y1, x2, y2)
+                       VALUES (%s, %s, %s, %s, %s, %s)""",
+                    (camera_id, LINE_NAME, x1, y1, x2, y2),
+                )
+            else:
+                cur.execute(
+                    """UPDATE count_lines
+                       SET x1 = %s, y1 = %s, x2 = %s, y2 = %s
+                       WHERE line_id = %s""",
+                    (x1, y1, x2, y2, int(line["line_id"])),
+                )
+
+            _ensure_rule(cur, site_id, config)
+
+            if site == "water_point":
+                _ensure_all_day_class_slots(cur, site_id)
+
+    return camera_id
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("video_uri", help="Video path, e.g. videos/test.mp4")
+    parser.add_argument(
+        "--site",
+        choices=tuple(SITE_CONFIG),
+        default="retail",
+        help="Site profile to seed (default: retail)",
+    )
+    args = parser.parse_args()
+
+    uri = str(Path(args.video_uri).expanduser().resolve())
+    camera_id = seed(uri, site=args.site)
+
+    print(f"Demo camera ready. site={args.site} camera_id={camera_id}")
+    print(f"Video URI: {uri}")
+    print("Review ZONE_POINTS and COUNT_LINE constants before running worker.py.")
+
+    if args.site == "water_point":
+        print("Created/reused the College Water Point restricted_presence rule.")
+        print("Ensured all-day class slots exist for all seven days.")
+        print("NOTE: the retail video is being used as a stand-in, not real water-point footage.")
+
+
+if __name__ == "__main__":
+    main()
+B.35  Engine Demo Script
+File: tools/demo_engine.py
+"""Run the AuraVision vision engine on a video or webcam."""
+
+import argparse
+from pathlib import Path
+
+import cv2
+
+from engine.annotate import FrameAnnotator
+from engine.detector import PersonDetector
+from engine.heatmap import HeatmapAccumulator
+
+
+def parse_source(value: str) -> str | int:
+    """Interpret a numeric source as a webcam index."""
+    if value.isdigit():
+        return int(value)
+
+    return value
+
+
+def main() -> None:
+    """Run detection, tracking, annotation, and heatmap accumulation."""
+    parser = argparse.ArgumentParser(
+        description="AuraVision vision-engine demonstration"
+    )
+
+    parser.add_argument(
+        "source",
+        help="Video file path or webcam index, such as 0",
+    )
+    parser.add_argument(
+        "--weights",
+        default="yolov8n.pt",
+        help="YOLOv8 weights path (default: yolov8n.pt)",
+    )
+    parser.add_argument(
+        "--conf",
+        type=float,
+        default=0.25,
+        help="Detection confidence threshold",
+    )
+    parser.add_argument(
+        "--imgsz",
+        type=int,
+        default=960,
+        help="YOLO inference image size",
+    )
+    parser.add_argument(
+        "--heatmap",
+        default="heatmap.png",
+        help="Output PNG path",
+    )
+
+    args = parser.parse_args()
+    source = parse_source(args.source)
+
+    if isinstance(source, str) and not Path(source).is_file():
+        parser.error(f"Video file does not exist: {source}")
+
+    detector = PersonDetector(
+        weights=args.weights,
+        conf=args.conf,
+        imgsz=args.imgsz,
+    )
+
+    annotator = FrameAnnotator()
+    capture = cv2.VideoCapture(source)
+
+    if not capture.isOpened():
+        raise RuntimeError(f"Could not open video source: {source}")
+
+    heatmap: HeatmapAccumulator | None = None
+
+    try:
+        while True:
+            success, frame = capture.read()
+
+            if not success:
+                break
+
+            if heatmap is None:
+                height, width = frame.shape[:2]
+                heatmap = HeatmapAccumulator(
+                    width=width,
+                    height=height,
+                )
+
+            tracks = detector.process(frame)
+            heatmap.update(tracks)
+
+            annotated = annotator.annotate(
+                frame=frame,
+                tracks=tracks,
+            )
+
+            cv2.imshow("AuraVision Vision Engine", annotated)
+
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+
+    finally:
+        capture.release()
+        cv2.destroyAllWindows()
+
+    if heatmap is not None:
+        heatmap.save_png(args.heatmap)
+        print(f"Heatmap saved to: {Path(args.heatmap).resolve()}")
+    else:
+        print("No frames were read; no heatmap was saved.")
+
+
+if __name__ == "__main__":
+    main()
+B.36  Context Generator
+File: tools/make_context.py
+"""Build CONTEXT.md: brief + code map (signatures only) + DB schema."""
+import ast
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+SKIP = {"venv", "__pycache__", ".git", "data", "videos", "logs", "tests"}
+
+
+def py_files():
+    for p in sorted(ROOT.rglob("*.py")):
+        rel = p.relative_to(ROOT)
+        if any(part in SKIP for part in rel.parts):
+            continue
+        yield p
+
+
+def sig(fn):
+    return f"{fn.name}({', '.join(a.arg for a in fn.args.args)})"
+
+
+def doc_line(node):
+    doc = ast.get_docstring(node)
+    return f"  # {doc.splitlines()[0]}" if doc else ""
+
+
+def summarize(path):
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except SyntaxError as exc:
+        return [f"  (could not parse: {exc})"]
+    lines = []
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            lines.append(f"  class {node.name}{doc_line(node)}")
+            for item in node.body:
+                if isinstance(item, ast.FunctionDef) and (
+                    item.name == "__init__" or not item.name.startswith("_")
+                ):
+                    lines.append(f"    def {sig(item)}{doc_line(item)}")
+        elif isinstance(node, ast.FunctionDef):
+            lines.append(f"  def {sig(node)}{doc_line(node)}")
+    return lines
+
+
+def main():
+    parts = []
+    brief = ROOT / "context_brief.md"
+    if brief.exists():
+        parts.append(brief.read_text(encoding="utf-8"))
+
+    code_map = ["## Code map (signatures only)"]
+    for f in py_files():
+        code_map.append(f"\n{f.relative_to(ROOT).as_posix()}")
+        code_map.extend(summarize(f))
+    parts.append("\n".join(code_map))
+
+    schema = ROOT / "db" / "schema.sql"
+    if schema.exists():
+        parts.append(
+            "## Database schema (FINAL)\n```sql\n"
+            + schema.read_text(encoding="utf-8")
+            + "\n```"
+        )
+
+    (ROOT / "CONTEXT.md").write_text("\n\n".join(parts), encoding="utf-8")
+    print("CONTEXT.md written")
+
+
+if __name__ == "__main__":
+    main()
