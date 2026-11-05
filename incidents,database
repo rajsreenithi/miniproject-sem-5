@@ -1,0 +1,409 @@
+File: rules/incidents.py
+
+"""Transactional incident lifecycle management."""
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+from typing import Any, Callable
+
+
+def _rows(cursor: Any) -> list[dict[str, Any]]:
+    result = cursor.fetchall()
+    if not result:
+        return []
+    if isinstance(result[0], dict):
+        return result
+    names = [column[0] for column in cursor.description]
+    return [dict(zip(names, row)) for row in result]
+
+
+class IncidentManager:
+    """Manage incidents for one camera using an injectable clock."""
+
+    def __init__(
+        self,
+        camera_id: int,
+        site_id: int,
+        connection_factory: Callable[[], Any],
+        clock: Callable[[], datetime] = datetime.now,
+    ) -> None:
+        self.camera_id = int(camera_id)
+        self.site_id = int(site_id)
+        self.connection_factory = connection_factory
+        self.clock = clock
+        self._below_since: dict[int, datetime] = {}
+
+    @staticmethod
+    def _count_tracks(
+        dwell_by_track: dict[tuple[int, int], float],
+        min_duration_sec: int,
+    ) -> int:
+        """Count unique tracks that meet the dwell threshold in any zone."""
+        return len({
+            track_id
+            for (_, track_id), dwell in dwell_by_track.items()
+            if float(dwell) >= int(min_duration_sec)
+        })
+
+    def evaluate(
+        self,
+        dwell_by_track: dict[tuple[int, int], float],
+        rule_engine: Any,
+        now: datetime | None = None,
+    ) -> None:
+        """Evaluate each eligible rule; each DB change is transactional."""
+        now = now or self.clock()
+        rules = rule_engine.get_rules(now)
+
+        for rule in rules:
+            rule_id = int(rule["rule_id"])
+            count = self._count_tracks(
+                dwell_by_track, int(rule["min_duration_sec"])
+            )
+            minimum = int(rule["min_people"])
+
+            try:
+                with self.connection_factory() as connection:
+                    with connection.cursor() as cursor:
+                        cursor.execute(
+                            """
+                            SELECT incident_id, started_at, ended_at,
+                                   peak_count, status
+                            FROM incidents
+                            WHERE camera_id = %s AND rule_id = %s
+                            ORDER BY started_at DESC, incident_id DESC
+                            LIMIT 1
+                            FOR UPDATE
+                            """,
+                            (self.camera_id, rule_id),
+                        )
+                        found = _rows(cursor)
+                        latest = found[0] if found else None
+
+                        if count >= minimum:
+                            self._below_since.pop(rule_id, None)
+
+                            if latest and latest["ended_at"] is None:
+                                cursor.execute(
+                                    """
+                                    UPDATE incidents
+                                    SET peak_count = GREATEST(peak_count, %s)
+                                    WHERE incident_id = %s
+                                      AND ended_at IS NULL
+                                    """,
+                                    (count, latest["incident_id"]),
+                                )
+                                continue
+
+                            if latest and latest["ended_at"] is not None:
+                                ended_at = latest["ended_at"]
+                                if isinstance(ended_at, str):
+                                    ended_at = datetime.fromisoformat(ended_at)
+
+                                elapsed = (now - ended_at).total_seconds()
+                                if elapsed <= int(rule["cooldown_sec"]):
+                                    cursor.execute(
+                                        """
+                                        UPDATE incidents
+                                        SET ended_at = NULL,
+                                            duration_sec = NULL,
+                                            status = 'open',
+                                            peak_count = GREATEST(peak_count, %s)
+                                        WHERE incident_id = %s
+                                        """,
+                                        (count, latest["incident_id"]),
+                                    )
+                                    continue
+
+                            cursor.execute(
+                                """
+                                INSERT INTO incidents
+                                    (camera_id, rule_id, started_at, peak_count)
+                                VALUES (%s, %s, %s, %s)
+                                """,
+                                (self.camera_id, rule_id, now, count),
+                            )
+                            incident_id = cursor.lastrowid
+
+                            cursor.execute(
+                                """
+                                SELECT recipient_id
+                                FROM recipients
+                                WHERE site_id = %s
+                                ORDER BY recipient_id
+                                """,
+                                (self.site_id,),
+                            )
+                            recipients = _rows(cursor)
+
+                            for recipient in recipients:
+                                cursor.execute(
+                                    """
+                                    INSERT INTO alerts
+                                        (incident_id, recipient_id, status)
+                                    VALUES (%s, %s, %s)
+                                    """,
+                                    (
+                                        incident_id,
+                                        recipient["recipient_id"],
+                                        "pending",
+                                    ),
+                                )
+
+                        elif latest and latest["ended_at"] is None:
+                            below_since = self._below_since.setdefault(
+                                rule_id, now
+                            )
+                            elapsed = (now - below_since).total_seconds()
+
+                            if elapsed >= int(rule["clear_after_sec"]):
+                                cursor.execute(
+                                    """
+                                    UPDATE incidents
+                                    SET ended_at = %s
+                                    WHERE incident_id = %s
+                                      AND ended_at IS NULL
+                                    """,
+                                    (now, latest["incident_id"]),
+                                )
+                                self._below_since.pop(rule_id, None)
+
+                        else:
+                            self._below_since.pop(rule_id, None)
+
+            except Exception:
+                # The connection context manager must roll back on failure.
+                # Do not suppress DB failures: the worker logs them.
+                raise
+Database (db/)
+B.12  Database Connection
+File: db/connection.py
+"""MySQL connection helpers for AuraVision.
+
+Reads DB_HOST, DB_USER, DB_PASSWORD and DB_NAME from a .env file in the
+project root (or from the process environment). Uses parameterized SQL in
+callers; this module deliberately exposes a connection, not SQL interpolation.
+"""
+from __future__ import annotations
+
+import os
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Iterator
+
+import pymysql
+from pymysql.connections import Connection
+
+
+def _load_env_file() -> None:
+    """Load simple KEY=VALUE entries from the project-root .env without overriding environment."""
+    env_path = Path(__file__).resolve().parents[1] / ".env"
+    if not env_path.exists():
+        return
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def _settings() -> dict:
+    _load_env_file()
+    return {
+        "host": os.getenv("DB_HOST", "127.0.0.1"),
+        "user": os.getenv("DB_USER", "root"),
+        "password": os.getenv("DB_PASSWORD", ""),
+        "database": os.getenv("DB_NAME", "auravision"),
+        "charset": "utf8mb4",
+        "cursorclass": pymysql.cursors.DictCursor,
+        "autocommit": False,
+        "connect_timeout": 5,
+        "read_timeout": 10,
+        "write_timeout": 10,
+    }
+
+
+def connect_with_retry(attempts: int = 3, delay_sec: float = 1.0) -> Connection:
+    """Connect to MySQL, retrying transient connection failures."""
+    if attempts < 1:
+        raise ValueError("attempts must be at least 1")
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            return pymysql.connect(**_settings())
+        except pymysql.MySQLError as exc:
+            last_error = exc
+            if attempt + 1 < attempts:
+                time.sleep(delay_sec * (attempt + 1))
+    assert last_error is not None
+    raise last_error
+
+
+@contextmanager
+def get_connection(attempts: int = 3, delay_sec: float = 1.0) -> Iterator[Connection]:
+    """Yield a connection and commit on success; roll back on exceptions."""
+    connection = connect_with_retry(attempts=attempts, delay_sec=delay_sec)
+    try:
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+B.13  Database Queries
+File: db/queries.py
+"""Parameterized database queries for the AuraVision worker."""
+from __future__ import annotations
+
+from datetime import date
+from typing import Iterable, Mapping, Any
+
+from db.connection import get_connection
+
+
+def load_camera_config(camera_id: int) -> dict:
+    """Return camera metadata, zones with ordered polygon points, and count lines."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT camera_id, site_id, name, floor_label, source_type,
+                          source_uri, frame_stride, is_active
+                   FROM cameras WHERE camera_id = %s""",
+                (camera_id,),
+            )
+            camera = cur.fetchone()
+            if camera is None:
+                raise ValueError(f"Camera {camera_id} does not exist")
+            cur.execute(
+                """SELECT zone_id, camera_id, name
+                   FROM zones WHERE camera_id = %s ORDER BY zone_id""",
+                (camera_id,),
+            )
+            zones = cur.fetchall()
+            for zone in zones:
+                cur.execute(
+                    """SELECT seq, x, y FROM zone_points
+                       WHERE zone_id = %s ORDER BY seq""",
+                    (zone["zone_id"],),
+                )
+                zone["points"] = cur.fetchall()
+                zone["polygon"] = [(int(p["x"]), int(p["y"])) for p in zone["points"]]
+            cur.execute(
+                """SELECT line_id, camera_id, name, x1, y1, x2, y2
+                   FROM count_lines WHERE camera_id = %s ORDER BY line_id""",
+                (camera_id,),
+            )
+            lines = cur.fetchall()
+    return {"camera": camera, "zones": zones, "count_lines": lines}
+
+
+def load_schedule(site_id: int) -> list[dict]:
+    """Load weekly schedule slots and date-specific exceptions for a site."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT slot_id, site_id, day_of_week, start_time, end_time, slot_type
+                   FROM schedule_slots WHERE site_id = %s
+                   ORDER BY day_of_week, start_time""",
+                (site_id,),
+            )
+            slots = cur.fetchall()
+            cur.execute(
+                """SELECT exception_id, site_id, on_date, mode, note
+                   FROM schedule_exceptions WHERE site_id = %s ORDER BY on_date""",
+                (site_id,),
+            )
+            exceptions = cur.fetchall()
+    return {"slots": slots, "exceptions": exceptions}
+
+
+def insert_observations(rows: Iterable[Mapping[str, Any]], batch_size: int = 500) -> int:
+    """Batch insert rows with camera_id, zone_id, ts, people_count."""
+    values = [
+        (int(r["camera_id"]), int(r["zone_id"]), r["ts"], int(r["people_count"]))
+        for r in rows
+    ]
+    if not values:
+        return 0
+    sql = """INSERT INTO observations (camera_id, zone_id, ts, people_count)
+             VALUES (%s, %s, %s, %s)"""
+    total = 0
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            for start in range(0, len(values), batch_size):
+                batch = values[start:start + batch_size]
+                cur.executemany(sql, batch)
+                total += cur.rowcount
+    return total
+
+
+def insert_visits(rows: Iterable[Mapping[str, Any]], batch_size: int = 200) -> int:
+    """Batch insert finished visits using the schema's exact column names."""
+    values = [
+        (
+            int(r["camera_id"]), int(r["zone_id"]), int(r["track_id"]),
+            r["entered_at"], r["left_at"], int(r["dwell_sec"])
+        )
+        for r in rows
+    ]
+    if not values:
+        return 0
+    sql = """INSERT INTO visits
+             (camera_id, zone_id, track_id, entered_at, left_at, dwell_sec)
+             VALUES (%s, %s, %s, %s, %s, %s)"""
+    total = 0
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            for start in range(0, len(values), batch_size):
+                batch = values[start:start + batch_size]
+                cur.executemany(sql, batch)
+                total += cur.rowcount
+    return total
+
+
+def insert_crossings(rows: Iterable[Mapping[str, Any]], batch_size: int = 200) -> int:
+    """Batch insert line crossings using the schema's exact column names."""
+    values = [
+        (
+            int(r["camera_id"]), int(r["line_id"]), int(r["track_id"]),
+            r["ts"], str(r["direction"])
+        )
+        for r in rows
+    ]
+    if not values:
+        return 0
+    sql = """INSERT INTO crossings
+             (camera_id, line_id, track_id, ts, direction)
+             VALUES (%s, %s, %s, %s, %s)"""
+    total = 0
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            for start in range(0, len(values), batch_size):
+                batch = values[start:start + batch_size]
+                cur.executemany(sql, batch)
+                total += cur.rowcount
+    return total
+
+
+def daily_report(site_id: int, report_date: date) -> list[dict]:
+    """Python equivalent of the daily_report stored procedure."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT c.floor_label, i.started_at, i.ended_at,
+                          i.duration_sec, i.peak_count
+                   FROM incidents AS i
+                   JOIN cameras AS c ON c.camera_id = i.camera_id
+                   WHERE c.site_id = %s
+                     AND i.started_at >= %s
+                     AND i.started_at < %s + INTERVAL 1 DAY
+                   ORDER BY i.started_at""",
+                (site_id, report_date, report_date),
+            )
+            return cur.fetchall()
