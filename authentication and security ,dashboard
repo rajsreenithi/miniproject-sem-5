@@ -1,0 +1,770 @@
+B.14  Authentication and Security
+File: web/auth.py
+"""Authentication, role authorization, and CSRF helpers."""
+from functools import wraps
+import hmac
+import secrets
+import time
+import bcrypt
+from flask import abort, flash, redirect, request, session, url_for
+from web.db_helpers import fetch_one
+
+# Per-process login throttling. For multi-worker deployment, move this to a shared store.
+_FAILED = {}
+_LOCK_SECONDS = 300
+_WINDOW_SECONDS = 900
+_MAX_FAILURES = 5
+
+
+def csrf_token():
+    token = session.get("csrf_token")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session["csrf_token"] = token
+    return token
+
+
+def validate_csrf():
+    supplied = request.form.get("csrf_token", "")
+    expected = session.get("csrf_token", "")
+    if not supplied or not expected or not hmac.compare_digest(supplied, expected):
+        abort(400, description="The form security token is missing or expired. Please go back and try again.")
+
+
+def _key():
+    return (request.remote_addr or "unknown", request.form.get("username", "").strip().lower())
+
+
+def login_locked():
+    now = time.time()
+    record = _FAILED.get(_key())
+    if not record:
+        return False, 0
+    failures, first, locked_until = record
+    if now < locked_until:
+        return True, int(locked_until - now) + 1
+    if now - first > _WINDOW_SECONDS:
+        _FAILED.pop(_key(), None)
+    return False, 0
+
+
+def record_login_failure():
+    now, key = time.time(), _key()
+    failures, first, locked_until = _FAILED.get(key, (0, now, 0))
+    if now - first > _WINDOW_SECONDS:
+        failures, first = 0, now
+    failures += 1
+    if failures >= _MAX_FAILURES:
+        locked_until = now + _LOCK_SECONDS
+    _FAILED[key] = (failures, first, locked_until)
+
+
+def clear_login_failures():
+    _FAILED.pop(_key(), None)
+
+
+def verify_login(username, password):
+    user = fetch_one("SELECT user_id, username, password_hash, role FROM users WHERE username = %s", (username,))
+    if not user:
+        # Keep the response path similar for unknown users.
+        bcrypt.checkpw(password.encode("utf-8"), bcrypt.hashpw(b"invalid-user-password", bcrypt.gensalt()))
+        return None
+    try:
+        valid = bcrypt.checkpw(password.encode("utf-8"), user["password_hash"].encode("utf-8"))
+    except (ValueError, TypeError):
+        valid = False
+    if not valid:
+        return None
+    return {"user_id": user["user_id"], "username": user["username"], "role": user["role"]}
+
+
+def login_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not session.get("user"):
+            flash("Please sign in to continue.", "warning")
+            return redirect(url_for("auth.login", next=request.path))
+        return view(*args, **kwargs)
+    return wrapped
+
+
+def role_required(*roles):
+    def decorator(view):
+        @wraps(view)
+        @login_required
+        def wrapped(*args, **kwargs):
+            if session.get("user", {}).get("role") not in roles:
+                abort(403)
+            return view(*args, **kwargs)
+        return wrapped
+    return decorator
+B.15  Web DB Helpers
+File: web/db_helpers.py
+"""Small database helpers for AuraVision's Flask web application."""
+from __future__ import annotations
+from contextlib import contextmanager
+from pathlib import Path
+import os
+import pymysql
+from pymysql.cursors import DictCursor
+
+
+def _load_env_file() -> None:
+    env_path = Path(__file__).resolve().parents[1] / ".env"
+    if not env_path.exists():
+        return
+    for raw in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key, value = key.strip(), value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def connect_db():
+    _load_env_file()
+    return pymysql.connect(
+        host=os.getenv("DB_HOST", "127.0.0.1"),
+        user=os.getenv("DB_USER", "root"),
+        password=os.getenv("DB_PASSWORD", ""),
+        database=os.getenv("DB_NAME", "auravision"),
+        charset="utf8mb4", cursorclass=DictCursor, autocommit=False,
+        connect_timeout=5, read_timeout=10, write_timeout=10,
+    )
+
+
+@contextmanager
+def db_cursor():
+    conn = connect_db()
+    try:
+        with conn.cursor() as cur:
+            yield cur
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def fetch_all(sql, params=()):
+    with db_cursor() as cur:
+        cur.execute(sql, params)
+        return cur.fetchall()
+
+
+def fetch_one(sql, params=()):
+    with db_cursor() as cur:
+        cur.execute(sql, params)
+        return cur.fetchone()
+B.16  Dashboard Routes
+File: web/routes_dashboard.py
+from datetime import date, datetime, timedelta
+from pathlib import Path
+import csv
+import io
+
+from flask import (
+    Blueprint, abort, make_response, redirect, render_template,
+    request, send_file, url_for
+)
+
+from web.auth import login_required
+from web.db_helpers import fetch_all, fetch_one
+from web.routes_admin import selected_site
+
+dashboard_bp = Blueprint("dashboard_pages", __name__)
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+LIVE_DIR = BASE_DIR / "data" / "live"
+HEATMAP_DIR = BASE_DIR / "data" / "heatmaps"
+
+
+
+def _site():
+    sites, site = selected_site()
+
+    if site is None:
+        return None
+
+    return site
+
+
+def _site_id():
+    site = _site()
+    return site["site_id"] if site else None
+
+
+
+def _site_cameras(site_id):
+    if site_id is None:
+        return []
+    return fetch_all(
+        """
+        SELECT camera_id, name, floor_label, is_active
+        FROM cameras
+        WHERE site_id = %s
+        ORDER BY name
+        """,
+        (site_id,),
+    )
+
+
+def _camera_for_site(camera_id, site_id):
+    if not camera_id or site_id is None:
+        return None
+    return fetch_one(
+        """
+        SELECT camera_id, name, floor_label, is_active
+        FROM cameras
+        WHERE camera_id = %s AND site_id = %s
+        """,
+        (camera_id, site_id),
+    )
+
+
+def _latest_observations(site_id):
+    if site_id is None:
+        return []
+
+    return fetch_all(
+        """
+        SELECT z.zone_id, z.name AS zone_name,
+               c.camera_id, c.name AS camera_name,
+               o.people_count, o.ts
+        FROM zones z
+        JOIN cameras c ON c.camera_id = z.camera_id
+        LEFT JOIN observations o
+          ON o.zone_id = z.zone_id
+         AND o.camera_id = c.camera_id
+         AND o.ts = (
+             SELECT MAX(o2.ts)
+             FROM observations o2
+             WHERE o2.zone_id = z.zone_id
+               AND o2.camera_id = c.camera_id
+         )
+        WHERE c.site_id = %s
+        ORDER BY c.name, z.name
+        """,
+        (site_id,),
+    )
+
+
+def _incident_rows(site_id, start_date=None, end_date=None, status=None):
+    if site_id is None:
+        return []
+
+    sql = """
+        SELECT i.incident_id, i.started_at, i.ended_at,
+               i.duration_sec, i.peak_count, i.status,
+               c.camera_id, c.name AS camera_name, c.floor_label,
+               r.rule_type,
+               (
+                   SELECT COUNT(*)
+                   FROM alerts a
+                   WHERE a.incident_id = i.incident_id
+               ) AS alert_count
+        FROM incidents i
+        JOIN cameras c ON c.camera_id = i.camera_id
+        JOIN rules r ON r.rule_id = i.rule_id
+        WHERE c.site_id = %s
+    """
+    params = [site_id]
+
+    if start_date:
+        sql += " AND i.started_at >= %s"
+        params.append(start_date)
+
+    if end_date:
+        sql += " AND i.started_at < %s"
+        params.append(end_date + timedelta(days=1))
+
+    if status in ("open", "closed"):
+        sql += " AND i.status = %s"
+        params.append(status)
+
+    sql += " ORDER BY i.started_at DESC LIMIT 500"
+    return fetch_all(sql, tuple(params))
+
+
+def _camera_health(camera_id):
+    """Return camera image freshness and the worker command for a camera."""
+    image_path = LIVE_DIR / f"camera_{camera_id}.jpg"
+    age = (datetime.now().timestamp() - image_path.stat().st_mtime) if image_path.is_file() else None
+    return {
+        "online": age is not None and age <= 30,
+        "age_sec": int(age) if age is not None else None,
+        "image_exists": image_path.is_file(),
+        "command": f"python worker.py --camera-id {camera_id} --loop",
+    }
+
+
+def _all_hours(rows):
+    """Always return all 24 hours, including hours with zero activity."""
+    totals = {int(row["hour"]): int(row["total"] or 0) for row in rows}
+    return [{"hour": hour, "total": totals.get(hour, 0)} for hour in range(24)]
+
+
+def _schedule_for_site(site_id):
+    if site_id is None:
+        return [], []
+    slots = fetch_all(
+        """SELECT slot_id, site_id, day_of_week, start_time, end_time, slot_type
+           FROM schedule_slots WHERE site_id = %s
+           ORDER BY day_of_week, start_time, slot_id""", (site_id,))
+    exceptions = fetch_all(
+        """SELECT exception_id, site_id, on_date, mode, note
+           FROM schedule_exceptions WHERE site_id = %s
+           ORDER BY on_date, exception_id""", (site_id,))
+    return slots, exceptions
+
+
+@dashboard_bp.route("/dashboard")
+@login_required
+def dashboard():
+    from rules.engine import is_restricted_for_schedule, schedule_period_label
+
+    site = _site()
+    site_id = site["site_id"] if site else None
+    now = datetime.now()
+    today = now.date()
+    midnight = datetime.combine(today, datetime.min.time())
+    tomorrow = midnight + timedelta(days=1)
+
+    people_now = open_incidents = entries_today = exits_today = avg_dwell = 0
+    zones, recent_incidents, hourly = [], [], []
+    cameras, camera_tiles = [], []
+    heatmap_camera = None
+    busiest_hour = None
+    longest_gathering = 0
+    peak_count_today = 0
+    violations_today = 0
+    compliance_pct = 100
+    current_period = "Outside college hours"
+    restricted = False
+    last_alert = None
+    class_hours = []
+    break_hours = []
+    occupancy_limit = 2
+
+    if site_id is not None:
+        latest = _latest_observations(site_id)
+        zones = latest
+        people_now = sum(int(row["people_count"] or 0) for row in latest
+                         if row.get("people_count") is not None)
+
+        cameras = _site_cameras(site_id)
+        camera_tiles = []
+        for camera in cameras:
+            health = _camera_health(camera["camera_id"])
+            count_rows = [r for r in latest if r["camera_id"] == camera["camera_id"]]
+            camera_tiles.append({
+                **camera, **health,
+                "people_count": sum(int(r["people_count"] or 0) for r in count_rows
+                                    if r.get("people_count") is not None),
+                "last_update": max((r["ts"] for r in count_rows if r.get("ts")), default=None),
+            })
+        heatmap_camera = next((c for c in cameras
+                               if (HEATMAP_DIR / f"camera_{c['camera_id']}.png").is_file()), None)
+
+        row = fetch_one(
+            """SELECT COUNT(*) AS total FROM incidents i
+               JOIN cameras c ON c.camera_id=i.camera_id
+               WHERE c.site_id=%s AND i.status='open'""", (site_id,))
+        open_incidents = int(row["total"] or 0) if row else 0
+
+        row = fetch_one(
+            """SELECT COUNT(*) AS total FROM crossings x JOIN cameras c ON c.camera_id=x.camera_id
+               WHERE c.site_id=%s AND x.direction='in' AND x.ts >= %s AND x.ts < %s""",
+            (site_id, midnight, tomorrow))
+        entries_today = int(row["total"] or 0) if row else 0
+        row = fetch_one(
+            """SELECT COUNT(*) AS total FROM crossings x JOIN cameras c ON c.camera_id=x.camera_id
+               WHERE c.site_id=%s AND x.direction='out' AND x.ts >= %s AND x.ts < %s""",
+            (site_id, midnight, tomorrow))
+        exits_today = int(row["total"] or 0) if row else 0
+        row = fetch_one(
+            """SELECT AVG(v.dwell_sec) AS average_dwell FROM visits v
+               JOIN cameras c ON c.camera_id=v.camera_id
+               WHERE c.site_id=%s AND v.entered_at >= %s AND v.entered_at < %s""",
+            (site_id, midnight, tomorrow))
+        avg_dwell = round(float(row["average_dwell"] or 0)) if row else 0
+
+        raw_hourly = fetch_all(
+            """SELECT HOUR(x.ts) AS hour, COUNT(*) AS total
+               FROM crossings x JOIN cameras c ON c.camera_id=x.camera_id
+               WHERE c.site_id=%s AND x.ts >= %s AND x.ts < %s
+               GROUP BY HOUR(x.ts) ORDER BY hour""", (site_id, midnight, tomorrow))
+        hourly = _all_hours(raw_hourly)
+        busiest = max(hourly, key=lambda item: item["total"], default=None)
+        busiest_hour = busiest["hour"] if busiest and busiest["total"] else None
+        recent_incidents = _incident_rows(site_id)[:8]
+
+        rule = fetch_one(
+            """SELECT min_people FROM rules
+               WHERE site_id=%s AND rule_type='occupancy_limit' AND is_active=1
+               ORDER BY rule_id LIMIT 1""", (site_id,))
+        occupancy_limit = max(1, int(rule["min_people"])) if rule else 2
+        for zone in zones:
+            count = zone.get("people_count")
+            zone["capacity"] = occupancy_limit
+            zone["percent"] = min(100, round((int(count or 0) / occupancy_limit) * 100))
+            if count is None:
+                zone["occupancy_state"] = "No data"
+            elif int(count) > occupancy_limit:
+                zone["occupancy_state"] = "Over limit"
+            elif int(count) >= occupancy_limit:
+                zone["occupancy_state"] = "Busy"
+            else:
+                zone["occupancy_state"] = "Normal"
+
+        slots, exceptions = _schedule_for_site(site_id)
+        current_period = schedule_period_label(now, slots, exceptions)
+        restricted = is_restricted_for_schedule(now, slots, exceptions)
+        from rules.engine import _as_time
+        class_hours, break_hours = set(), set()
+        for slot in slots:
+            if int(slot["day_of_week"]) != now.isoweekday():
+                continue
+            start_time, end_time = _as_time(slot["start_time"]), _as_time(slot["end_time"])
+            target = class_hours if slot["slot_type"] == "class" else break_hours
+            for hour in range(24):
+                probe = datetime.combine(today, datetime.min.time()).replace(hour=hour).time()
+                covered = (start_time <= probe < end_time) if start_time <= end_time else (probe >= start_time or probe < end_time)
+                if covered:
+                    target.add(hour)
+        class_hours, break_hours = sorted(class_hours), sorted(break_hours)
+
+        row = fetch_one(
+            """SELECT COUNT(*) AS total, COALESCE(MAX(i.peak_count),0) AS peak
+               FROM incidents i JOIN cameras c ON c.camera_id=i.camera_id
+               WHERE c.site_id=%s AND i.started_at >= %s AND i.started_at < %s
+                 AND i.rule_id IN (SELECT rule_id FROM rules WHERE site_id=%s AND rule_type='restricted_presence')""",
+            (site_id, midnight, tomorrow, site_id))
+        violations_today = int(row["total"] or 0) if row else 0
+        peak_count_today = int(row["peak"] or 0) if row else 0
+        longest_row = fetch_one(
+            """SELECT MAX(COALESCE(i.duration_sec,
+                      TIMESTAMPDIFF(SECOND,i.started_at,%s))) AS longest
+               FROM incidents i JOIN cameras c ON c.camera_id=i.camera_id
+               JOIN rules r ON r.rule_id=i.rule_id
+               WHERE c.site_id=%s AND r.rule_type='restricted_presence'
+                 AND i.started_at >= %s AND i.started_at < %s""",
+            (now, site_id, midnight, tomorrow))
+        longest_gathering = int(longest_row["longest"] or 0) if longest_row else 0
+
+        # Compliance is the share of today's class-period camera checks without an active violation.
+        class_slot_count = sum(1 for s in slots if int(s["day_of_week"]) == now.isoweekday()
+                               and s["slot_type"] == "class")
+        expected_checks = max(1, class_slot_count * max(1, len(cameras)))
+        compliance_pct = max(0, min(100, round((1 - violations_today / expected_checks) * 100)))
+
+        last_alert = fetch_one(
+            """SELECT a.status, a.sent_at, a.error_msg, r.name AS recipient_name,
+                      i.started_at
+               FROM alerts a JOIN incidents i ON i.incident_id=a.incident_id
+               JOIN cameras c ON c.camera_id=i.camera_id
+               JOIN recipients r ON r.recipient_id=a.recipient_id
+               WHERE c.site_id=%s ORDER BY a.alert_id DESC LIMIT 1""", (site_id,))
+
+    max_hourly = max((item["total"] for item in hourly), default=0)
+    is_water = bool(site and site.get("site_type") == "water_point")
+    return render_template(
+        "dashboard.html", site=site, today=today, now=now,
+        people_now=people_now, open_incidents=open_incidents,
+        entries_today=entries_today, exits_today=exits_today, avg_dwell=avg_dwell,
+        zones=zones, recent_incidents=recent_incidents, hourly=hourly,
+        max_hourly=max_hourly, busiest_hour=busiest_hour, cameras=cameras,
+        camera_tiles=camera_tiles, heatmap_camera=heatmap_camera,
+        occupancy_limit=occupancy_limit, is_water=is_water,
+        current_period=current_period, restricted=restricted,
+        violations_today=violations_today, longest_gathering=longest_gathering,
+        peak_count_today=peak_count_today, compliance_pct=compliance_pct,
+        last_alert=last_alert, class_hours=class_hours, break_hours=break_hours,
+        worker_online=any(c["online"] for c in camera_tiles),
+    )
+
+
+@dashboard_bp.route("/live")
+@login_required
+def live():
+    site = _site()
+    site_id = site["site_id"] if site else None
+    cameras = _site_cameras(site_id)
+
+    requested_id = request.args.get("camera_id", type=int)
+    camera = _camera_for_site(requested_id, site_id) if requested_id else (
+        cameras[0] if cameras else None
+    )
+
+    image_exists = bool(
+        camera and (LIVE_DIR / f"camera_{camera['camera_id']}.jpg").is_file()
+    )
+
+    return render_template(
+        "live.html",
+        site=site,
+        cameras=cameras,
+        camera=camera,
+        image_exists=image_exists,
+    )
+
+
+@dashboard_bp.route("/live/snapshot/<int:camera_id>")
+@login_required
+def live_snapshot(camera_id):
+    camera = _camera_for_site(camera_id, _site_id())
+    if not camera:
+        abort(404)
+
+    image_path = LIVE_DIR / f"camera_{camera_id}.jpg"
+    if not image_path.is_file():
+        abort(404)
+
+    return send_file(image_path, mimetype="image/jpeg", as_attachment=True,
+                     download_name=f"camera_{camera_id}.jpg")
+
+
+@dashboard_bp.route("/incidents")
+@login_required
+def incidents():
+    site = _site()
+    site_id = site["site_id"] if site else None
+
+    today = date.today()
+    start_value = request.args.get("start", today.isoformat())
+    end_value = request.args.get("end", today.isoformat())
+    status = request.args.get("status", "")
+
+    try:
+        start_date = date.fromisoformat(start_value)
+    except ValueError:
+        start_date = today
+        start_value = today.isoformat()
+
+    try:
+        end_date = date.fromisoformat(end_value)
+    except ValueError:
+        end_date = today
+        end_value = today.isoformat()
+
+    if end_date < start_date:
+        start_date, end_date = end_date, start_date
+        start_value, end_value = end_value.isoformat(), start_value
+
+    rows = _incident_rows(
+        site_id,
+        start_date=start_date,
+        end_date=end_date,
+        status=status,
+    )
+
+    worst_hours = []
+    if site_id is not None:
+        worst_hours = fetch_all(
+            """
+            SELECT HOUR(i.started_at) AS hour, COUNT(*) AS total
+            FROM incidents i
+            JOIN cameras c ON c.camera_id = i.camera_id
+            WHERE c.site_id = %s
+              AND i.started_at >= %s
+              AND i.started_at < %s
+            GROUP BY HOUR(i.started_at)
+            ORDER BY total DESC, hour
+            LIMIT 8
+            """,
+            (site_id, start_date, end_date + timedelta(days=1)),
+        )
+
+    max_worst = max(
+        (int(row["total"] or 0) for row in worst_hours),
+        default=0,
+    )
+
+    return render_template(
+        "incidents.html",
+        site=site,
+        incidents=rows,
+        start_value=start_value,
+        end_value=end_value,
+        status=status,
+        worst_hours=worst_hours,
+        max_worst=max_worst,
+    )
+@dashboard_bp.route("/live/frame/<int:camera_id>")
+@login_required
+def live_frame(camera_id):
+    camera = _camera_for_site(camera_id, _site_id())
+    if not camera:
+        abort(404)
+
+    image_path = LIVE_DIR / f"camera_{camera_id}.jpg"
+    if not image_path.is_file():
+        abort(404)
+
+    response = send_file(image_path, mimetype="image/jpeg", conditional=True)
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return response
+
+
+@dashboard_bp.route("/heatmap/image/<int:camera_id>")
+@login_required
+def heatmap_image(camera_id):
+    camera = _camera_for_site(camera_id, _site_id())
+    if not camera:
+        abort(404)
+
+    image_path = HEATMAP_DIR / f"camera_{camera_id}.png"
+    if not image_path.is_file():
+        abort(404)
+
+    response = send_file(image_path, mimetype="image/png", conditional=True)
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return response
+
+@dashboard_bp.route("/heatmap")
+@login_required
+def heatmap():
+    site = _site()
+    site_id = site["site_id"] if site else None
+    cameras = _site_cameras(site_id)
+
+    requested_id = request.args.get("camera_id", type=int)
+    camera = _camera_for_site(requested_id, site_id) if requested_id else (
+        cameras[0] if cameras else None
+    )
+
+    image_exists = bool(
+        camera and (HEATMAP_DIR / f"camera_{camera['camera_id']}.png").is_file()
+    )
+
+    return render_template(
+        "heatmap.html",
+        site=site,
+        cameras=cameras,
+        camera=camera,
+        image_exists=image_exists,
+    )
+
+
+def _report_context(site, start, end):
+    if not site:
+        return build_report_data(None, start, end)
+    return build_report_data(site, start, end)
+
+
+@dashboard_bp.route("/reports")
+@login_required
+def reports():
+    site = _site()
+    try:
+        preset, start_date, end_date = _report_dates(request.args)
+        date_error = None
+    except ValueError as exc:
+        preset = "custom"
+        start_date = end_date = date.today()
+        date_error = str(exc)
+
+    data = _report_context(site, start_date, end_date)
+    return render_template(
+        "reports.html", site=site, preset=preset,
+        start_date=start_date, end_date=end_date,
+        start_value=start_date.isoformat(), end_value=end_date.isoformat(),
+        date_error=date_error, report=data,
+    )
+
+
+@dashboard_bp.route("/reports/pdf")
+@login_required
+def report_pdf():
+    site = _site()
+    if site is None:
+        abort(404)
+    try:
+        start_date = date.fromisoformat(request.args.get("from", ""))
+        end_date = date.fromisoformat(request.args.get("to", ""))
+    except (TypeError, ValueError):
+        abort(400, description="Use from=YYYY-MM-DD and to=YYYY-MM-DD.")
+    if end_date < start_date or (end_date - start_date).days > 366:
+        abort(400, description="Invalid report date range.")
+
+    data = build_report_data(site, start_date, end_date)
+    generated_by = (session.get("user") or {}).get("username", "Unknown user")
+    pdf_bytes = build_pdf(data, generated_by)
+    safe_site = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(site.get("name", "site"))).strip("_") or "site"
+    filename = f"AuraVision_{safe_site}_{start_date.isoformat()}_{end_date.isoformat()}.pdf"
+    return send_file(
+        io.BytesIO(pdf_bytes), mimetype="application/pdf", as_attachment=True,
+        download_name=filename, max_age=0,
+    )
+
+
+@dashboard_bp.route("/reports/print")
+@login_required
+def print_report():
+    """Open an inline PDF so the browser's built-in PDF viewer can print it."""
+    site = _site()
+    if site is None:
+        abort(404)
+    try:
+        start_date = date.fromisoformat(request.args.get("from", ""))
+        end_date = date.fromisoformat(request.args.get("to", ""))
+    except (TypeError, ValueError):
+        abort(400, description="Use from=YYYY-MM-DD and to=YYYY-MM-DD.")
+    if end_date < start_date or (end_date - start_date).days > 366:
+        abort(400, description="Invalid report date range.")
+    data = build_report_data(site, start_date, end_date)
+    generated_by = (session.get("user") or {}).get("username", "Unknown user")
+    pdf_bytes = build_pdf(data, generated_by)
+    safe_site = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(site.get("name", "site"))).strip("_") or "site"
+    filename = f"AuraVision_{safe_site}_{start_date.isoformat()}_{end_date.isoformat()}.pdf"
+    return send_file(io.BytesIO(pdf_bytes), mimetype="application/pdf", as_attachment=False, download_name=filename, max_age=0)
+
+
+@dashboard_bp.route("/reports/export.csv")
+@login_required
+def export_report_csv():
+    site = _site()
+    if site is None:
+        abort(404)
+    try:
+        start_date = date.fromisoformat(request.args.get("from", request.args.get("date", date.today().isoformat())))
+        end_date = date.fromisoformat(request.args.get("to", start_date.isoformat()))
+    except (TypeError, ValueError):
+        abort(400, description="Use valid from and to dates.")
+    if end_date < start_date or (end_date - start_date).days > 366:
+        abort(400, description="Invalid report date range.")
+
+    data = build_report_data(site, start_date, end_date)
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow(["incident_id", "started_at", "ended_at", "duration_sec", "peak_count", "floor_label", "status", "alert_status", "rule_type"])
+    for row in data["incidents"]:
+        writer.writerow([row.get("incident_id"), row.get("started_at"), row.get("ended_at"), row.get("duration_sec"), row.get("peak_count"), row.get("floor_label") or "", row.get("status") or "", row.get("alert_status") or "No alerts", row.get("rule_type") or ""])
+
+    response = make_response("\ufeff" + output.getvalue())
+    response.headers["Content-Type"] = "text/csv; charset=utf-8"
+    response.headers["Content-Disposition"] = f'attachment; filename="AuraVision_{site["site_id"]}_{start_date.isoformat()}_{end_date.isoformat()}.csv"'
+    return response
+
+
+@dashboard_bp.route("/reports/chart/<chart>.png")
+@login_required
+def report_chart(chart):
+    site = _site()
+    if site is None:
+        abort(404)
+    if chart not in ("hourly", "incidents"):
+        abort(404)
+    try:
+        start_date = date.fromisoformat(request.args.get("from", date.today().isoformat()))
+        end_date = date.fromisoformat(request.args.get("to", start_date.isoformat()))
+    except (TypeError, ValueError):
+        abort(400)
+    if end_date < start_date or (end_date - start_date).days > 366:
+        abort(400)
+    data = build_report_data(site, start_date, end_date)
+    image = build_chart_png(data, chart)
+    return send_file(image, mimetype="image/png", max_age=0)
