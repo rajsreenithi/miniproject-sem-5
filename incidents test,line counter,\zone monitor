@@ -1,0 +1,811 @@
+B.34  Demo Data Seeder
+File: tools/seed_demo.py
+
+"""Idempotently seed a demo camera, zone, counting line, and site-specific rule."""
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+from db.connection import get_connection
+
+# Edit these image-pixel coordinates to match your video resolution/scene.
+ZONE_NAME = "Demo Zone"
+ZONE_POINTS = [
+    (250, 150),
+    (950, 150),
+    (950, 650),
+    (250, 650),
+]
+LINE_NAME = "Demo Entry Line"
+COUNT_LINE = (600, 150, 600, 650)  # x1, y1, x2, y2
+FLOOR_LABEL = "Ground"
+
+SITE_CONFIG = {
+    "retail": {
+        "site_name": "Demo Retail Store",
+        "site_type": "retail",
+        "camera_name": "Demo Camera",
+        "rule_type": "occupancy_limit",
+        "min_people": 2,
+        "min_duration_sec": 30,
+        "clear_after_sec": 60,
+        "cooldown_sec": 600,
+    },
+    "water_point": {
+        "site_name": "College Water Point",
+        "site_type": "water_point",
+        "camera_name": "College Water Point Camera",
+        "rule_type": "restricted_presence",
+        "min_people": 2,
+        "min_duration_sec": 30,
+        "clear_after_sec": 60,
+        "cooldown_sec": 600,
+    },
+}
+
+ALL_DAY_START = "00:00:00"
+ALL_DAY_END = "23:59:59"
+
+
+def _ensure_rule(cur, site_id: int, config: dict) -> None:
+    """Create the site's demo rule if missing; ensure it is active."""
+    cur.execute(
+        """SELECT rule_id
+           FROM rules
+           WHERE site_id = %s AND rule_type = %s
+           ORDER BY rule_id
+           LIMIT 1""",
+        (site_id, config["rule_type"]),
+    )
+    rule = cur.fetchone()
+
+    if rule is None:
+        cur.execute(
+            """INSERT INTO rules
+               (site_id, rule_type, min_people, min_duration_sec,
+                clear_after_sec, cooldown_sec, is_active)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+            (
+                site_id,
+                config["rule_type"],
+                config["min_people"],
+                config["min_duration_sec"],
+                config["clear_after_sec"],
+                config["cooldown_sec"],
+                True,
+            ),
+        )
+    else:
+        cur.execute(
+            "UPDATE rules SET is_active = %s WHERE rule_id = %s",
+            (True, int(rule["rule_id"])),
+        )
+
+
+def _ensure_all_day_class_slots(cur, site_id: int) -> None:
+    """Ensure a class slot covers the whole day for each weekday (Monday=1)."""
+    for day_of_week in range(1, 8):
+        cur.execute(
+            """SELECT slot_id
+               FROM schedule_slots
+               WHERE site_id = %s
+                 AND day_of_week = %s
+                 AND start_time = %s
+                 AND end_time = %s
+                 AND slot_type = %s
+               LIMIT 1""",
+            (
+                site_id,
+                day_of_week,
+                ALL_DAY_START,
+                ALL_DAY_END,
+                "class",
+            ),
+        )
+        if cur.fetchone() is None:
+            cur.execute(
+                """INSERT INTO schedule_slots
+                   (site_id, day_of_week, start_time, end_time, slot_type)
+                   VALUES (%s, %s, %s, %s, %s)""",
+                (
+                    site_id,
+                    day_of_week,
+                    ALL_DAY_START,
+                    ALL_DAY_END,
+                    "class",
+                ),
+            )
+
+
+def seed(video_uri: str, site: str = "retail") -> int:
+    """Create missing demo records and return the camera_id.
+
+    Existing matching site, camera, zone, line, and rule records are reused.
+    The water_point profile also gets an active restricted-presence rule and
+    an all-day class slot for every weekday.
+    """
+    if site not in SITE_CONFIG:
+        raise ValueError(
+            f"Unsupported site profile {site!r}. "
+            f"Choose one of: {', '.join(SITE_CONFIG)}"
+        )
+
+    config = SITE_CONFIG[site]
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT site_id FROM sites WHERE name = %s LIMIT 1",
+                (config["site_name"],),
+            )
+            site_row = cur.fetchone()
+
+            if site_row is None:
+                cur.execute(
+                    "INSERT INTO sites (name, site_type) VALUES (%s, %s)",
+                    (config["site_name"], config["site_type"]),
+                )
+                site_id = int(cur.lastrowid)
+            else:
+                site_id = int(site_row["site_id"])
+                # Keep the site's type aligned with the selected profile.
+                cur.execute(
+                    "UPDATE sites SET site_type = %s WHERE site_id = %s",
+                    (config["site_type"], site_id),
+                )
+
+            cur.execute(
+                """SELECT camera_id
+                   FROM cameras
+                   WHERE site_id = %s
+                     AND name = %s
+                     AND source_type = %s
+                     AND source_uri = %s
+                   LIMIT 1""",
+                (site_id, config["camera_name"], "file", video_uri),
+            )
+            camera = cur.fetchone()
+
+            if camera is None:
+                cur.execute(
+                    """INSERT INTO cameras
+                       (site_id, name, floor_label, source_type, source_uri,
+                        frame_stride, is_active)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                    (
+                        site_id,
+                        config["camera_name"],
+                        FLOOR_LABEL,
+                        "file",
+                        video_uri,
+                        2,
+                        True,
+                    ),
+                )
+                camera_id = int(cur.lastrowid)
+            else:
+                camera_id = int(camera["camera_id"])
+
+            cur.execute(
+                "SELECT zone_id FROM zones WHERE camera_id = %s AND name = %s LIMIT 1",
+                (camera_id, ZONE_NAME),
+            )
+            zone = cur.fetchone()
+
+            if zone is None:
+                cur.execute(
+                    "INSERT INTO zones (camera_id, name) VALUES (%s, %s)",
+                    (camera_id, ZONE_NAME),
+                )
+                zone_id = int(cur.lastrowid)
+            else:
+                zone_id = int(zone["zone_id"])
+
+            # Make reruns deterministic: replace this zone's vertices.
+            cur.execute("DELETE FROM zone_points WHERE zone_id = %s", (zone_id,))
+            cur.executemany(
+                """INSERT INTO zone_points (zone_id, seq, x, y)
+                   VALUES (%s, %s, %s, %s)""",
+                [
+                    (zone_id, seq, x, y)
+                    for seq, (x, y) in enumerate(ZONE_POINTS, start=1)
+                ],
+            )
+
+            cur.execute(
+                "SELECT line_id FROM count_lines WHERE camera_id = %s AND name = %s LIMIT 1",
+                (camera_id, LINE_NAME),
+            )
+            line = cur.fetchone()
+            x1, y1, x2, y2 = COUNT_LINE
+
+            if line is None:
+                cur.execute(
+                    """INSERT INTO count_lines
+                       (camera_id, name, x1, y1, x2, y2)
+                       VALUES (%s, %s, %s, %s, %s, %s)""",
+                    (camera_id, LINE_NAME, x1, y1, x2, y2),
+                )
+            else:
+                cur.execute(
+                    """UPDATE count_lines
+                       SET x1 = %s, y1 = %s, x2 = %s, y2 = %s
+                       WHERE line_id = %s""",
+                    (x1, y1, x2, y2, int(line["line_id"])),
+                )
+
+            _ensure_rule(cur, site_id, config)
+
+            if site == "water_point":
+                _ensure_all_day_class_slots(cur, site_id)
+
+    return camera_id
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("video_uri", help="Video path, e.g. videos/test.mp4")
+    parser.add_argument(
+        "--site",
+        choices=tuple(SITE_CONFIG),
+        default="retail",
+        help="Site profile to seed (default: retail)",
+    )
+    args = parser.parse_args()
+
+    uri = str(Path(args.video_uri).expanduser().resolve())
+    camera_id = seed(uri, site=args.site)
+
+    print(f"Demo camera ready. site={args.site} camera_id={camera_id}")
+    print(f"Video URI: {uri}")
+    print("Review ZONE_POINTS and COUNT_LINE constants before running worker.py.")
+
+    if args.site == "water_point":
+        print("Created/reused the College Water Point restricted_presence rule.")
+        print("Ensured all-day class slots exist for all seven days.")
+        print("NOTE: the retail video is being used as a stand-in, not real water-point footage.")
+
+
+if __name__ == "__main__":
+    main()
+B.35  Engine Demo Script
+File: tools/demo_engine.py
+"""Run the AuraVision vision engine on a video or webcam."""
+
+import argparse
+from pathlib import Path
+
+import cv2
+
+from engine.annotate import FrameAnnotator
+from engine.detector import PersonDetector
+from engine.heatmap import HeatmapAccumulator
+
+
+def parse_source(value: str) -> str | int:
+    """Interpret a numeric source as a webcam index."""
+    if value.isdigit():
+        return int(value)
+
+    return value
+
+
+def main() -> None:
+    """Run detection, tracking, annotation, and heatmap accumulation."""
+    parser = argparse.ArgumentParser(
+        description="AuraVision vision-engine demonstration"
+    )
+
+    parser.add_argument(
+        "source",
+        help="Video file path or webcam index, such as 0",
+    )
+    parser.add_argument(
+        "--weights",
+        default="yolov8n.pt",
+        help="YOLOv8 weights path (default: yolov8n.pt)",
+    )
+    parser.add_argument(
+        "--conf",
+        type=float,
+        default=0.25,
+        help="Detection confidence threshold",
+    )
+    parser.add_argument(
+        "--imgsz",
+        type=int,
+        default=960,
+        help="YOLO inference image size",
+    )
+    parser.add_argument(
+        "--heatmap",
+        default="heatmap.png",
+        help="Output PNG path",
+    )
+
+    args = parser.parse_args()
+    source = parse_source(args.source)
+
+    if isinstance(source, str) and not Path(source).is_file():
+        parser.error(f"Video file does not exist: {source}")
+
+    detector = PersonDetector(
+        weights=args.weights,
+        conf=args.conf,
+        imgsz=args.imgsz,
+    )
+
+    annotator = FrameAnnotator()
+    capture = cv2.VideoCapture(source)
+
+    if not capture.isOpened():
+        raise RuntimeError(f"Could not open video source: {source}")
+
+    heatmap: HeatmapAccumulator | None = None
+
+    try:
+        while True:
+            success, frame = capture.read()
+
+            if not success:
+                break
+
+            if heatmap is None:
+                height, width = frame.shape[:2]
+                heatmap = HeatmapAccumulator(
+                    width=width,
+                    height=height,
+                )
+
+            tracks = detector.process(frame)
+            heatmap.update(tracks)
+
+            annotated = annotator.annotate(
+                frame=frame,
+                tracks=tracks,
+            )
+
+            cv2.imshow("AuraVision Vision Engine", annotated)
+
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+
+    finally:
+        capture.release()
+        cv2.destroyAllWindows()
+
+    if heatmap is not None:
+        heatmap.save_png(args.heatmap)
+        print(f"Heatmap saved to: {Path(args.heatmap).resolve()}")
+    else:
+        print("No frames were read; no heatmap was saved.")
+
+
+if __name__ == "__main__":
+    main()
+B.36  Context Generator
+File: tools/make_context.py
+"""Build CONTEXT.md: brief + code map (signatures only) + DB schema."""
+import ast
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+SKIP = {"venv", "__pycache__", ".git", "data", "videos", "logs", "tests"}
+
+
+def py_files():
+    for p in sorted(ROOT.rglob("*.py")):
+        rel = p.relative_to(ROOT)
+        if any(part in SKIP for part in rel.parts):
+            continue
+        yield p
+
+
+def sig(fn):
+    return f"{fn.name}({', '.join(a.arg for a in fn.args.args)})"
+
+
+def doc_line(node):
+    doc = ast.get_docstring(node)
+    return f"  # {doc.splitlines()[0]}" if doc else ""
+
+
+def summarize(path):
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except SyntaxError as exc:
+        return [f"  (could not parse: {exc})"]
+    lines = []
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            lines.append(f"  class {node.name}{doc_line(node)}")
+            for item in node.body:
+                if isinstance(item, ast.FunctionDef) and (
+                    item.name == "__init__" or not item.name.startswith("_")
+                ):
+                    lines.append(f"    def {sig(item)}{doc_line(item)}")
+        elif isinstance(node, ast.FunctionDef):
+            lines.append(f"  def {sig(node)}{doc_line(node)}")
+    return lines
+
+
+def main():
+    parts = []
+    brief = ROOT / "context_brief.md"
+    if brief.exists():
+        parts.append(brief.read_text(encoding="utf-8"))
+
+    code_map = ["## Code map (signatures only)"]
+    for f in py_files():
+        code_map.append(f"\n{f.relative_to(ROOT).as_posix()}")
+        code_map.extend(summarize(f))
+    parts.append("\n".join(code_map))
+
+    schema = ROOT / "db" / "schema.sql"
+    if schema.exists():
+        parts.append(
+            "## Database schema (FINAL)\n```sql\n"
+            + schema.read_text(encoding="utf-8")
+            + "\n```"
+        )
+
+    (ROOT / "CONTEXT.md").write_text("\n\n".join(parts), encoding="utf-8")
+    print("CONTEXT.md written")
+
+
+if __name__ == "__main__":
+    main()
+Tests (tests/)
+B.37  Zone Monitor Tests
+File: tests/test_zones.py
+"""Tests for polygon presence and zone visit completion."""
+
+from datetime import datetime, timedelta
+
+from engine.tracker import Track
+from engine.zones import ZoneMonitor
+
+
+def make_track(
+    track_id: int,
+    x: float,
+    y: float,
+) -> Track:
+    """Create a synthetic track with a chosen foot point."""
+    return Track(
+        track_id=track_id,
+        bbox=(int(x - 5), int(y - 10), int(x + 5), int(y)),
+        foot_point=(x, y),
+        confidence=0.95,
+    )
+
+
+def test_zone_entry_and_delayed_exit() -> None:
+    """A visit ends only after the outside grace period."""
+    monitor = ZoneMonitor(
+        zones={
+            1: [
+                (0, 0),
+                (100, 0),
+                (100, 100),
+                (0, 100),
+            ]
+        },
+        grace_sec=2,
+    )
+
+    start = datetime(2026, 10, 25, 10, 0, 0)
+
+    counts, visits = monitor.update(
+        [make_track(7, 50, 50)],
+        start,
+    )
+
+    assert counts == {1: 1}
+    assert visits == []
+
+    # The person leaves the polygon.
+    counts, visits = monitor.update(
+        [make_track(7, 150, 50)],
+        start + timedelta(seconds=5),
+    )
+
+    assert counts == {1: 1}
+    assert visits == []
+
+    # One second outside: still within the grace period.
+    counts, visits = monitor.update(
+        [],
+        start + timedelta(seconds=6),
+    )
+
+    assert counts == {1: 1}
+    assert visits == []
+
+    # Two seconds outside: the visit is now complete.
+    counts, visits = monitor.update(
+        [],
+        start + timedelta(seconds=7),
+    )
+
+    assert counts == {1: 0}
+    assert len(visits) == 1
+
+    visit = visits[0]
+    assert visit.zone_id == 1
+    assert visit.track_id == 7
+    assert visit.entered_at == start
+    assert visit.left_at == start + timedelta(seconds=5)
+    assert visit.dwell_sec == 5
+
+
+def test_return_inside_cancels_pending_exit() -> None:
+    """Briefly leaving a zone must not create a second visit."""
+    monitor = ZoneMonitor(
+        zones={
+            1: [
+                (0, 0),
+                (100, 0),
+                (100, 100),
+                (0, 100),
+            ]
+        },
+        grace_sec=2,
+    )
+
+    start = datetime(2026, 10, 25, 11, 0, 0)
+
+    monitor.update([make_track(3, 50, 50)], start)
+
+    monitor.update(
+        [make_track(3, 150, 50)],
+        start + timedelta(seconds=3),
+    )
+
+    counts, visits = monitor.update(
+        [make_track(3, 50, 50)],
+        start + timedelta(seconds=4),
+    )
+
+    assert counts == {1: 1}
+    assert visits == []
+
+    # Leaving again starts a fresh grace period.
+    monitor.update(
+        [],
+        start + timedelta(seconds=5),
+    )
+
+    counts, visits = monitor.update(
+        [],
+        start + timedelta(seconds=7),
+    )
+
+    assert counts == {1: 0}
+    assert len(visits) == 1
+    assert visits[0].entered_at == start
+    assert visits[0].left_at == start + timedelta(seconds=5)
+    assert visits[0].dwell_sec == 5
+
+
+def test_multiple_zones_count_independently() -> None:
+    """One person can be counted in the appropriate zone."""
+    monitor = ZoneMonitor(
+        zones={
+            1: [(0, 0), (50, 0), (50, 50), (0, 50)],
+            2: [(60, 0), (100, 0), (100, 50), (60, 50)],
+        }
+    )
+
+    now = datetime(2026, 10, 25, 12, 0, 0)
+
+    counts, visits = monitor.update(
+        [
+            make_track(1, 20, 20),
+            make_track(2, 80, 20),
+        ],
+        now,
+    )
+
+    assert counts == {1: 1, 2: 1}
+    assert visits == []
+B.38  Line Counter Tests
+File: tests/test_linecount.py
+"""Tests for directional line crossing."""
+
+from datetime import datetime, timedelta
+
+from engine.linecount import LineCounter
+from engine.tracker import Track
+
+
+def make_track(
+    track_id: int,
+    x: float,
+    y: float,
+) -> Track:
+    """Create a synthetic track at a chosen foot point."""
+    return Track(
+        track_id=track_id,
+        bbox=(int(x - 5), int(y - 10), int(x + 5), int(y)),
+        foot_point=(x, y),
+        confidence=0.90,
+    )
+
+
+def test_crossing_in_and_back_out() -> None:
+    """Crossing a line in opposite directions emits opposite events."""
+    counter = LineCounter(
+        lines={
+            1: ((0, 50), (100, 50)),
+        }
+    )
+
+    start = datetime(2026, 10, 25, 10, 0, 0)
+
+    # The point starts above the horizontal line.
+    assert counter.update([make_track(10, 50, 40)], start) == []
+
+    # Negative side to positive side means "in".
+    crossings = counter.update(
+        [make_track(10, 50, 60)],
+        start + timedelta(seconds=1),
+    )
+
+    assert len(crossings) == 1
+    assert crossings[0].line_id == 1
+    assert crossings[0].track_id == 10
+    assert crossings[0].direction == "in"
+
+    # Remaining below the line must not produce duplicate counts.
+    assert counter.update(
+        [make_track(10, 50, 70)],
+        start + timedelta(seconds=2),
+    ) == []
+
+    # Positive side to negative side means "out".
+    crossings = counter.update(
+        [make_track(10, 50, 40)],
+        start + timedelta(seconds=3),
+    )
+
+    assert len(crossings) == 1
+    assert crossings[0].direction == "out"
+    assert crossings[0].ts == start + timedelta(seconds=3)
+
+
+def test_multiple_tracks_are_independent() -> None:
+    """Each track maintains independent crossing history."""
+    counter = LineCounter(
+        lines={
+            1: ((0, 50), (100, 50)),
+        }
+    )
+
+    now = datetime(2026, 10, 25, 11, 0, 0)
+
+    counter.update(
+        [
+            make_track(1, 20, 40),
+            make_track(2, 80, 60),
+        ],
+        now,
+    )
+
+    crossings = counter.update(
+        [
+            make_track(1, 20, 60),
+            make_track(2, 80, 40),
+        ],
+        now + timedelta(seconds=1),
+    )
+
+    assert len(crossings) == 2
+
+    directions = {
+        crossing.track_id: crossing.direction
+        for crossing in crossings
+    }
+
+    assert directions == {
+        1: "in",
+        2: "out",
+    }
+
+
+def test_points_on_line_do_not_duplicate_crossings() -> None:
+    """A foot point on the line does not repeatedly trigger counts."""
+    counter = LineCounter(
+        lines={
+            1: ((0, 50), (100, 50)),
+        }
+    )
+
+    now = datetime(2026, 10, 25, 12, 0, 0)
+
+    counter.update([make_track(5, 50, 40)], now)
+
+    assert counter.update(
+        [make_track(5, 50, 50)],
+        now + timedelta(seconds=1),
+    ) == []
+
+    crossings = counter.update(
+        [make_track(5, 50, 60)],
+        now + timedelta(seconds=2),
+    )
+
+    assert len(crossings) == 1
+    assert crossings[0].direction == "in"
+B.39  Incident Tests
+File: tests/test_incidents.py
+
+from datetime import datetime, timedelta
+
+from rules.incidents import IncidentManager
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = datetime(2026, 10, 26, 10, 0, 0)
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += timedelta(seconds=seconds)
+
+
+class FakeRuleEngine:
+    def __init__(self, rules):
+        self.rules = rules
+
+    def get_rules(self, now=None):
+        return self.rules
+
+
+def test_count_requires_minimum_dwell():
+    dwell = {
+        (1, 101): 2,
+        (1, 102): 3,
+    }
+
+    assert IncidentManager._count_tracks(dwell, 10) == 0
+
+
+def test_count_uses_unique_tracks_across_zones():
+    dwell = {
+        (1, 101): 15,
+        (2, 101): 20,
+        (1, 102): 12,
+        (2, 103): 2,
+    }
+
+    assert IncidentManager._count_tracks(dwell, 10) == 2
+
+
+def test_fake_clock_advances_without_sleeping():
+    clock = FakeClock()
+    start = clock()
+
+    clock.advance(5)
+
+    assert (clock() - start).total_seconds() == 5
+
+
+def test_rule_engine_rules_can_be_stubbed():
+    rules = [
+        {
+            "rule_id": 1,
+            "rule_type": "occupancy_limit",
+            "min_people": 2,
+            "min_duration_sec": 10,
+            "clear_after_sec": 5,
+            "cooldown_sec": 60,
+        }
+    ]
+
+    engine = FakeRuleEngine(rules)
+
+    assert engine.get_rules()[0]["rule_id"] == 1
