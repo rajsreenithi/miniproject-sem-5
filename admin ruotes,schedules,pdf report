@@ -1,0 +1,780 @@
+File: web/routes_admin.py
+"""Administration routes. All SQL uses PyMySQL placeholders."""
+from datetime import datetime
+
+from flask import Blueprint, abort, flash, redirect, render_template, request, session, url_for
+
+from web.auth import login_required, role_required
+from web.db_helpers import db_cursor, fetch_all, fetch_one
+from web.schedule_helpers import (
+    parse_day_form, build_week_preview, get_right_now, build_form_values,
+    build_schedule_view, build_day_timeline, build_week_summary,
+)
+
+admin_bp = Blueprint("admin", __name__)
+DAYS = [(1, "Monday"), (2, "Tuesday"), (3, "Wednesday"), (4, "Thursday"), (5, "Friday"), (6, "Saturday"), (7, "Sunday")]
+
+
+def selected_site():
+    sites = fetch_all("SELECT site_id, name, site_type FROM sites ORDER BY name")
+    valid_ids = {int(s["site_id"]) for s in sites}
+    try:
+        chosen = int(session.get("site_id", 0))
+    except (TypeError, ValueError):
+        chosen = 0
+    if chosen not in valid_ids and sites:
+        chosen = int(sites[0]["site_id"])
+        session["site_id"] = chosen
+    site = next((s for s in sites if int(s["site_id"]) == chosen), None)
+    return sites, site
+
+
+@admin_bp.route("/site", methods=["POST"])
+def set_site():
+    sites = fetch_all("SELECT site_id FROM sites")
+    valid = {int(row["site_id"]) for row in sites}
+
+    try:
+        site_id = int(request.form.get("site_id", ""))
+    except (TypeError, ValueError):
+        site_id = -1
+
+    if site_id not in valid:
+        flash("Choose a valid site.", "danger")
+    else:
+        session["site_id"] = site_id
+        flash("Site changed successfully.", "success")
+
+    return redirect(url_for("dashboard"))
+
+def _valid_day(value, default):
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return number if 1 <= number <= 7 else default
+
+
+@admin_bp.route("/schedule", methods=["GET", "POST"])
+@login_required
+def schedule():
+    sites, site = selected_site()
+    user_role = session.get("user", {}).get("role", "viewer")
+    can_edit = user_role in ("admin", "hod")
+    today_num = datetime.now().isoweekday()
+    selected_day = _valid_day(request.args.get("day"), today_num)
+
+    if not site:
+        return render_template(
+            "schedule.html", sites=sites, site=None, days=DAYS, view=None,
+            exceptions=[], can_edit=can_edit, errors={}, form_values={},
+            selected_day=selected_day, today_num=today_num,
+        )
+
+    if site.get("site_type") != "water_point":
+        flash("Schedules apply to the water-point site only.", "info")
+        return redirect(url_for("dashboard"))
+
+    errors = {}
+    form_values = {}
+    if request.method == "POST":
+        if not can_edit:
+            abort(403)
+        action = request.form.get("action", "")
+        if action == "save_day":
+            try:
+                source_day = int(request.form.get("day_of_week", "0"))
+                if source_day not in range(1, 8):
+                    raise ValueError("Choose a valid weekday.")
+                selected_day = source_day
+                source_values, source_slots, day_errors = parse_day_form(request.form, source_day)
+                form_values.update(source_values)
+                errors.update(day_errors)
+
+                target_days = [source_day]
+                for day_num, _day_name in DAYS:
+                    if request.form.get(f"apply_{day_num}") == "1" and day_num != source_day:
+                        target_days.append(day_num)
+
+                if not errors:
+                    with db_cursor() as cur:
+                        for day_num in target_days:
+                            cur.execute(
+                                "DELETE FROM schedule_slots WHERE site_id=%s AND day_of_week=%s",
+                                (site["site_id"], day_num),
+                            )
+                            for slot_start, slot_end, slot_type in source_slots:
+                                cur.execute(
+                                    """INSERT INTO schedule_slots
+                                       (site_id, day_of_week, start_time, end_time, slot_type)
+                                       VALUES (%s, %s, %s, %s, %s)""",
+                                    (site["site_id"], day_num, slot_start, slot_end, slot_type),
+                                )
+                    names = [name for number, name in DAYS if number in target_days]
+                    flash("Timetable saved for " + ", ".join(names) + ".", "success")
+                    return redirect(url_for("admin.schedule", day=source_day, _anchor="editor"))
+            except ValueError as exc:
+                errors["general"] = str(exc)
+        elif action == "clear_day":
+            try:
+                day_num = int(request.form.get("day_of_week", "0"))
+                if day_num not in range(1, 8):
+                    raise ValueError("Choose a valid weekday.")
+                with db_cursor() as cur:
+                    cur.execute(
+                        "DELETE FROM schedule_slots WHERE site_id=%s AND day_of_week=%s",
+                        (site["site_id"], day_num),
+                    )
+                flash("Timetable cleared for " + dict(DAYS)[day_num] + ".", "success")
+                return redirect(url_for("admin.schedule", day=day_num, _anchor="editor"))
+            except ValueError as exc:
+                flash(str(exc), "danger")
+                return redirect(url_for("admin.schedule"))
+        elif action in ("exception_add", "exception_edit", "exception_delete"):
+            try:
+                if action == "exception_add":
+                    on_date = datetime.strptime(request.form.get("on_date", ""), "%Y-%m-%d").date()
+                    mode = request.form.get("mode", "")
+                    note = request.form.get("note", "").strip()[:150]
+                    if mode not in ("unrestricted", "restricted"):
+                        raise ValueError("Choose a valid exception mode.")
+                    with db_cursor() as cur:
+                        cur.execute(
+                            "INSERT INTO schedule_exceptions (site_id,on_date,mode,note) VALUES (%s,%s,%s,%s)",
+                            (site["site_id"], on_date, mode, note or None),
+                        )
+                    flash("Schedule exception added.", "success")
+                elif action == "exception_edit":
+                    exception_id = int(request.form.get("exception_id", "0"))
+                    on_date = datetime.strptime(request.form.get("on_date", ""), "%Y-%m-%d").date()
+                    mode = request.form.get("mode", "")
+                    note = request.form.get("note", "").strip()[:150]
+                    if mode not in ("unrestricted", "restricted"):
+                        raise ValueError("Choose a valid exception mode.")
+                    with db_cursor() as cur:
+                        cur.execute(
+                            """UPDATE schedule_exceptions SET on_date=%s,mode=%s,note=%s
+                               WHERE exception_id=%s AND site_id=%s""",
+                            (on_date, mode, note or None, exception_id, site["site_id"]),
+                        )
+                    flash("Schedule exception updated.", "success")
+                else:
+                    exception_id = int(request.form.get("exception_id", "0"))
+                    with db_cursor() as cur:
+                        cur.execute(
+                            "DELETE FROM schedule_exceptions WHERE exception_id=%s AND site_id=%s",
+                            (exception_id, site["site_id"]),
+                        )
+                    flash("Schedule exception deleted.", "success")
+                return redirect(url_for("admin.schedule"))
+            except (ValueError, KeyError):
+                flash("Please enter a valid date, mode, and exception.", "danger")
+                return redirect(url_for("admin.schedule"))
+        else:
+            flash("Unknown schedule action.", "danger")
+            return redirect(url_for("admin.schedule"))
+
+    slots = fetch_all(
+        """SELECT slot_id, site_id, day_of_week, start_time, end_time, slot_type
+           FROM schedule_slots WHERE site_id=%s ORDER BY day_of_week,start_time""",
+        (site["site_id"],),
+    )
+    exceptions = fetch_all(
+        """SELECT exception_id,site_id,on_date,mode,note FROM schedule_exceptions
+           WHERE site_id=%s ORDER BY on_date""",
+        (site["site_id"],),
+    )
+    stored_values = build_form_values(slots)      # preload the editor with saved times
+    stored_values.update(form_values)             # typed values win when validation failed
+    view = build_schedule_view(slots, exceptions)
+    day_view = build_day_timeline(slots, selected_day)
+    week_summary = build_week_summary(slots)
+    return render_template(
+        "schedule.html", sites=sites, site=site, days=DAYS, view=view,
+        day_view=day_view, week_summary=week_summary,
+        exceptions=exceptions, can_edit=can_edit, errors=errors,
+        form_values=stored_values, selected_day=selected_day, today_num=today_num,
+    )
+@admin_bp.route("/rules", methods=["GET", "POST"])
+@role_required("admin", "hod")
+def rules():
+    sites, site = selected_site()
+    if not site:
+        return render_template("rules.html", sites=sites, site=None, rules=[])
+    if request.method == "POST":
+        try:
+            rule_id = int(request.form.get("rule_id", "0"))
+            min_people = int(request.form.get("min_people", "2"))
+            min_duration = int(request.form.get("min_duration_sec", "30"))
+            clear_after = int(request.form.get("clear_after_sec", "60"))
+            cooldown = int(request.form.get("cooldown_sec", "600"))
+            is_active = 1 if request.form.get("is_active") == "1" else 0
+            if min_people < 1 or min_duration < 0 or clear_after < 0 or cooldown < 0:
+                raise ValueError("People must be at least 1; durations cannot be negative.")
+            if not fetch_one("SELECT rule_id FROM rules WHERE rule_id=%s AND site_id=%s", (rule_id, site["site_id"])):
+                raise ValueError("Rule not found for the selected site.")
+            with db_cursor() as cur:
+                cur.execute("UPDATE rules SET min_people=%s,min_duration_sec=%s,clear_after_sec=%s,cooldown_sec=%s,is_active=%s WHERE rule_id=%s AND site_id=%s",
+                            (min_people, min_duration, clear_after, cooldown, is_active, rule_id, site["site_id"]))
+            flash("Rule settings saved.", "success")
+        except (ValueError, KeyError) as exc:
+            flash(str(exc), "danger")
+        return redirect(url_for("admin.rules"))
+    rules_data = fetch_all("SELECT rule_id,site_id,rule_type,min_people,min_duration_sec,clear_after_sec,cooldown_sec,is_active FROM rules WHERE site_id=%s ORDER BY rule_id", (site["site_id"],))
+    return render_template("rules.html", sites=sites, site=site, rules=rules_data)
+
+
+@admin_bp.route("/recipients", methods=["GET", "POST"])
+@role_required("admin", "hod")
+def recipients():
+    sites, site = selected_site()
+    if not site:
+        return render_template("recipients.html", sites=sites, site=None, recipients=[])
+    if request.method == "POST":
+        action = request.form.get("action", "")
+        try:
+            name = request.form.get("name", "").strip()
+            channel = request.form.get("channel", "")
+            address = request.form.get("address", "").strip()
+            if action in ("add", "edit"):
+                if not name or len(name) > 80 or not address or len(address) > 150 or channel not in ("telegram", "email", "sms"):
+                    raise ValueError("Enter a name, valid channel, and address within the allowed lengths.")
+                with db_cursor() as cur:
+                    if action == "add":
+                        cur.execute("INSERT INTO recipients (site_id,name,channel,address) VALUES (%s,%s,%s,%s)", (site["site_id"], name, channel, address))
+                    else:
+                        cur.execute("UPDATE recipients SET name=%s,channel=%s,address=%s WHERE recipient_id=%s AND site_id=%s",
+                                    (name, channel, address, int(request.form["recipient_id"]), site["site_id"]))
+                flash("Recipient saved.", "success")
+            elif action == "delete":
+                with db_cursor() as cur:
+                    cur.execute("DELETE FROM recipients WHERE recipient_id=%s AND site_id=%s", (int(request.form["recipient_id"]), site["site_id"]))
+                flash("Recipient deleted.", "success")
+            else:
+                raise ValueError("Unknown recipient action.")
+        except (ValueError, KeyError) as exc:
+            flash(str(exc), "danger")
+        return redirect(url_for("admin.recipients"))
+    rows = fetch_all("SELECT recipient_id,site_id,name,channel,address FROM recipients WHERE site_id=%s ORDER BY name", (site["site_id"],))
+    return render_template("recipients.html", sites=sites, site=site, recipients=rows)
+
+
+@admin_bp.route("/cameras", methods=["GET", "POST"])
+@role_required("admin")
+def cameras():
+    sites, site = selected_site()
+    if request.method == "POST":
+        action = request.form.get("action", "")
+        try:
+            if action in ("add", "edit"):
+                name = request.form.get("name", "").strip()
+                floor = request.form.get("floor_label", "").strip()
+                source_type = request.form.get("source_type", "")
+                source_uri = request.form.get("source_uri", "").strip()
+                stride = int(request.form.get("frame_stride", "2"))
+                active = 1 if request.form.get("is_active") == "1" else 0
+                if not name or len(name) > 100 or len(floor) > 30 or not source_uri or len(source_uri) > 500 or source_type not in ("file", "rtsp", "webcam") or not 1 <= stride <= 255:
+                    raise ValueError("Check the camera name, floor, source type, source URI, and frame stride (1–255).")
+                site_id = int(request.form.get("site_id", site["site_id"] if site else 0))
+                if not fetch_one("SELECT site_id FROM sites WHERE site_id=%s", (site_id,)):
+                    raise ValueError("Choose a valid site.")
+                with db_cursor() as cur:
+                    if action == "add":
+                        cur.execute("INSERT INTO cameras (site_id,name,floor_label,source_type,source_uri,frame_stride,is_active) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                                    (site_id, name, floor or None, source_type, source_uri, stride, active))
+                    else:
+                        cur.execute("UPDATE cameras SET site_id=%s,name=%s,floor_label=%s,source_type=%s,source_uri=%s,frame_stride=%s,is_active=%s WHERE camera_id=%s",
+                                    (site_id, name, floor or None, source_type, source_uri, stride, active, int(request.form["camera_id"])))
+                flash("Camera saved.", "success")
+            elif action == "delete":
+                with db_cursor() as cur:
+                    cur.execute("DELETE FROM cameras WHERE camera_id=%s", (int(request.form["camera_id"]),))
+                flash("Camera deleted.", "success")
+            else:
+                raise ValueError("Unknown camera action.")
+        except (ValueError, KeyError) as exc:
+            flash(str(exc), "danger")
+        return redirect(url_for("admin.cameras"))
+    camera_rows = fetch_all("SELECT c.camera_id,c.site_id,c.name,c.floor_label,c.source_type,c.source_uri,c.frame_stride,c.is_active,s.name AS site_name FROM cameras c JOIN sites s ON s.site_id=c.site_id ORDER BY s.name,c.name")
+    return render_template("cameras.html", sites=sites, site=site, cameras=camera_rows)
+B.18  Schedule Helpers
+File: web/schedule_helpers.py
+"""Shared timetable parsing, preview, and current-state helpers for water-point sites."""
+from __future__ import annotations
+
+from datetime import datetime, time, timedelta
+
+
+DAY_NAMES = {
+    1: "Monday", 2: "Tuesday", 3: "Wednesday", 4: "Thursday",
+    5: "Friday", 6: "Saturday", 7: "Sunday",
+}
+
+
+def _minutes(value):
+    """Minutes since midnight from time, timedelta, datetime or 'HH:MM[:SS]' text."""
+    if isinstance(value, timedelta):
+        return int(value.total_seconds() // 60) % (24 * 60)
+    if isinstance(value, (time, datetime)):
+        return value.hour * 60 + value.minute
+    parts = str(value or "").strip().split(":")
+    if len(parts) < 2:
+        return None
+    try:
+        hour, minute = int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return hour * 60 + minute
+
+
+def _hhmm(value):
+    minute = _minutes(value)
+    return f"{minute // 60:02d}:{minute % 60:02d}" if minute is not None else ""
+
+
+def _hhmm_from_minutes(minutes):
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+def _minute_time(minutes):
+    return f"{minutes // 60:02d}:{minutes % 60:02d}:00"
+
+
+def _duration_text(minutes):
+    minutes = int(minutes)
+    if minutes < 60:
+        return f"{minutes} min"
+    hours, rest = divmod(minutes, 60)
+    return f"{hours} h" if rest == 0 else f"{hours} h {rest} min"
+
+
+def parse_day_form(form, day_num):
+    """Validate one day's form and return (values, slots, field_errors)."""
+    prefix = f"day_{day_num}_"
+    start = (form.get(prefix + "start") or "").strip()
+    end = (form.get(prefix + "end") or "").strip()
+    values = {prefix + "start": start, prefix + "end": end}
+    errors = {}
+    start_min, end_min = _minutes(start), _minutes(end)
+
+    if start_min is None:
+        errors[prefix + "start"] = "Enter the college-day start time."
+    if end_min is None:
+        errors[prefix + "end"] = "Enter the college-day end time."
+    if start_min is not None and end_min is not None and end_min <= start_min:
+        errors[prefix + "end"] = "End time must be after start time."
+
+    breaks = []
+    for index in range(1, 4):
+        break_prefix = prefix + f"break_{index}_"
+        bstart = (form.get(break_prefix + "start") or "").strip()
+        bend = (form.get(break_prefix + "end") or "").strip()
+        values[break_prefix + "start"] = bstart
+        values[break_prefix + "end"] = bend
+        if not bstart and not bend:
+            continue
+        if not bstart:
+            errors[break_prefix + "start"] = "Enter this break's start time."
+            continue
+        if not bend:
+            errors[break_prefix + "end"] = "Enter this break's end time."
+            continue
+        bstart_min, bend_min = _minutes(bstart), _minutes(bend)
+        if bstart_min is None:
+            errors[break_prefix + "start"] = "Enter a valid time."
+        if bend_min is None:
+            errors[break_prefix + "end"] = "Enter a valid time."
+        if bstart_min is None or bend_min is None:
+            continue
+        if bend_min <= bstart_min:
+            errors[break_prefix + "end"] = "Break end must be after its start."
+        if start_min is not None and end_min is not None:
+            if bstart_min < start_min or bend_min > end_min:
+                errors[break_prefix + "start"] = "Break must be inside the college day."
+                errors[break_prefix + "end"] = "Break must be inside the college day."
+        breaks.append((bstart_min, bend_min, index, break_prefix))
+
+    ordered = sorted(breaks)
+    for previous, current in zip(ordered, ordered[1:]):
+        if current[0] < previous[1]:
+            errors[previous[3] + "end"] = "Breaks cannot overlap."
+            errors[current[3] + "start"] = "Breaks cannot overlap."
+
+    slots = []
+    if start_min is not None and end_min is not None and end_min > start_min:
+        valid_breaks = [
+            (bstart, bend) for bstart, bend, _idx, _prefix in ordered
+            if bend > bstart and bstart >= start_min and bend <= end_min
+        ]
+        cursor = start_min
+        for bstart, bend in valid_breaks:
+            if bstart > cursor:
+                slots.append((_minute_time(cursor), _minute_time(bstart), "class"))
+            slots.append((_minute_time(bstart), _minute_time(bend), "break"))
+            cursor = bend
+        if cursor < end_min:
+            slots.append((_minute_time(cursor), _minute_time(end_min), "class"))
+    return values, slots, errors
+
+
+def build_week_preview(slots):
+    """Per-day timeline segments (each day scaled to its own hours). Kept for compatibility."""
+    preview = []
+    for day_num, day_name in DAY_NAMES.items():
+        day_slots = []
+        for slot in slots:
+            if int(slot.get("day_of_week", 0)) != day_num:
+                continue
+            start = _minutes(slot.get("start_time"))
+            end = _minutes(slot.get("end_time"))
+            if start is not None and end is not None and end > start:
+                day_slots.append({
+                    "start": start, "end": end,
+                    "slot_type": slot.get("slot_type"),
+                    "start_label": _hhmm(slot.get("start_time")),
+                    "end_label": _hhmm(slot.get("end_time")),
+                })
+        day_slots.sort(key=lambda item: item["start"])
+        if not day_slots:
+            preview.append({"day_num": day_num, "day_name": day_name,
+                            "start_label": "—", "end_label": "—", "segments": []})
+            continue
+        day_start = min(item["start"] for item in day_slots)
+        day_end = max(item["end"] for item in day_slots)
+        span = max(1, day_end - day_start)
+        segments = []
+        cursor = day_start
+        for item in day_slots:
+            if item["start"] > cursor:
+                segments.append({
+                    "kind": "gap", "label": "Gap",
+                    "start_label": _hhmm_from_minutes(cursor),
+                    "end_label": _hhmm_from_minutes(item["start"]),
+                    "left": (cursor - day_start) * 100 / span,
+                    "width": (item["start"] - cursor) * 100 / span,
+                })
+            segments.append({
+                "kind": item["slot_type"],
+                "label": "Gathering not allowed" if item["slot_type"] == "class" else "Allowed",
+                "start_label": item["start_label"], "end_label": item["end_label"],
+                "left": (item["start"] - day_start) * 100 / span,
+                "width": (item["end"] - item["start"]) * 100 / span,
+            })
+            cursor = max(cursor, item["end"])
+        if cursor < day_end:
+            segments.append({
+                "kind": "gap", "label": "Gap",
+                "start_label": _hhmm_from_minutes(cursor),
+                "end_label": _hhmm_from_minutes(day_end),
+                "left": (cursor - day_start) * 100 / span,
+                "width": (day_end - cursor) * 100 / span,
+            })
+        preview.append({
+            "day_num": day_num, "day_name": day_name,
+            "start_label": _hhmm_from_minutes(day_start),
+            "end_label": _hhmm_from_minutes(day_end), "segments": segments,
+        })
+    return preview
+
+
+def get_right_now(site_id, slots, exceptions, now=None):
+    """Describe whether gathering is allowed at the current local server time."""
+    now = now or datetime.now()
+    today = now.date()
+    for exception in exceptions:
+        on_date = exception.get("on_date")
+        if isinstance(on_date, datetime):
+            on_date = on_date.date()
+        if on_date == today:
+            if exception.get("mode") == "unrestricted":
+                return "Allowed — today's unrestricted exception is active."
+            return "Gathering not allowed — today's restricted exception is active."
+
+    day_num = now.isoweekday()
+    minute_now = now.hour * 60 + now.minute
+    for slot in slots:
+        if int(slot.get("day_of_week", 0)) != day_num:
+            continue
+        start, end = _minutes(slot.get("start_time")), _minutes(slot.get("end_time"))
+        if start is not None and end is not None and start <= minute_now < end:
+            if slot.get("slot_type") == "class":
+                return "Gathering not allowed — it is college/class time."
+            return "Allowed — it is a scheduled break."
+    return "Allowed — outside scheduled class time."
+
+
+def build_form_values(slots):
+    """Reconstruct editable daily fields from the saved class/break slots."""
+    values = {}
+    for day_num in DAY_NAMES:
+        prefix = f"day_{day_num}_"
+        day_slots = [
+            slot for slot in slots
+            if int(slot.get("day_of_week", 0)) == day_num
+            and _minutes(slot.get("start_time")) is not None
+            and _minutes(slot.get("end_time")) is not None
+        ]
+        if not day_slots:
+            values[prefix + "start"] = ""
+            values[prefix + "end"] = ""
+            for index in range(1, 4):
+                values[prefix + f"break_{index}_start"] = ""
+                values[prefix + f"break_{index}_end"] = ""
+            continue
+        values[prefix + "start"] = _hhmm(min(day_slots, key=lambda s: _minutes(s["start_time"]))["start_time"])
+        values[prefix + "end"] = _hhmm(max(day_slots, key=lambda s: _minutes(s["end_time"]))["end_time"])
+        breaks = sorted(
+            (slot for slot in day_slots if slot.get("slot_type") == "break"),
+            key=lambda s: _minutes(s["start_time"]),
+        )
+        for index in range(1, 4):
+            if index <= len(breaks):
+                values[prefix + f"break_{index}_start"] = _hhmm(breaks[index - 1]["start_time"])
+                values[prefix + f"break_{index}_end"] = _hhmm(breaks[index - 1]["end_time"])
+            else:
+                values[prefix + f"break_{index}_start"] = ""
+                values[prefix + f"break_{index}_end"] = ""
+    return values
+
+
+# ---------------------------------------------------------------- shared-axis view
+
+def _collect_slots(slots):
+    by_day = {number: [] for number in DAY_NAMES}
+    for slot in slots:
+        try:
+            day = int(slot.get("day_of_week", 0))
+        except (TypeError, ValueError):
+            continue
+        if day not in by_day:
+            continue
+        start, end = _minutes(slot.get("start_time")), _minutes(slot.get("end_time"))
+        if start is None or end is None or end <= start:
+            continue
+        by_day[day].append({
+            "start": start, "end": end,
+            "kind": "class" if slot.get("slot_type") == "class" else "break",
+        })
+    for items in by_day.values():
+        items.sort(key=lambda item: item["start"])
+    return by_day
+
+
+def describe_now(slots, exceptions, now=None):
+    """Return {state, headline, detail}; state is class, break, outside or holiday."""
+    now = now or datetime.now()
+    today = now.date()
+    for exc in exceptions:
+        on_date = exc.get("on_date")
+        if isinstance(on_date, datetime):
+            on_date = on_date.date()
+        if on_date == today:
+            note = f" ({exc['note']})" if exc.get("note") else ""
+            if exc.get("mode") == "unrestricted":
+                return {"state": "holiday",
+                        "headline": f"Holiday or exception today{note} — no restrictions",
+                        "detail": "Gathering is allowed all day."}
+            return {"state": "class",
+                    "headline": f"Restricted all day{note} — gathering not allowed",
+                    "detail": "A restricted exception overrides the weekly timetable."}
+
+    items = _collect_slots(slots)[now.isoweekday()]
+    minute_now = now.hour * 60 + now.minute
+    if not items:
+        return {"state": "outside", "headline": "No timetable for today — no restrictions",
+                "detail": "Add a timetable for this weekday in the editor below."}
+
+    current = next((i for i in items if i["start"] <= minute_now < i["end"]), None)
+    if current and current["kind"] == "class":
+        nxt = next((i for i in items if i["kind"] == "break" and i["start"] > minute_now), None)
+        if nxt:
+            detail = f"Next break at {_hhmm_from_minutes(nxt['start'])} (in {_duration_text(nxt['start'] - minute_now)})."
+        else:
+            detail = f"Class period ends at {_hhmm_from_minutes(current['end'])} (in {_duration_text(current['end'] - minute_now)})."
+        return {"state": "class", "headline": "Class period — gathering not allowed", "detail": detail}
+    if current and current["kind"] == "break":
+        nxt = next((i for i in items if i["kind"] == "class" and i["start"] >= current["end"]), None)
+        if nxt:
+            detail = f"Class resumes at {_hhmm_from_minutes(nxt['start'])} (in {_duration_text(nxt['start'] - minute_now)})."
+        else:
+            detail = f"The college day ends at {_hhmm_from_minutes(current['end'])}."
+        return {"state": "break", "headline": "Break — gathering allowed", "detail": detail}
+
+    if minute_now < items[0]["start"]:
+        return {"state": "outside", "headline": "Outside college hours — no restrictions",
+                "detail": f"The college day starts at {_hhmm_from_minutes(items[0]['start'])} (in {_duration_text(items[0]['start'] - minute_now)})."}
+    return {"state": "outside", "headline": "Outside college hours — no restrictions",
+            "detail": "Today's college day has ended."}
+
+
+def build_schedule_view(slots, exceptions, now=None):
+    """Weekly rows on ONE shared time axis, plus ruler ticks, now marker and status."""
+    now = now or datetime.now()
+    today_num = now.isoweekday()
+    now_min = now.hour * 60 + now.minute
+    by_day = _collect_slots(slots)
+
+    everything = [item for items in by_day.values() for item in items]
+    if everything:
+        low = min(i["start"] for i in everything) - 30
+        high = max(i["end"] for i in everything) + 30
+    else:
+        low, high = 8 * 60, 18 * 60
+    axis_start = max(0, (low // 60) * 60)
+    axis_end = min(24 * 60, ((high + 59) // 60) * 60)
+    if axis_end <= axis_start:
+        axis_end = min(24 * 60, axis_start + 60)
+    span = axis_end - axis_start
+    hours = max(1, span // 60)
+    step = 1 if hours <= 10 else 2
+
+    def pct(minute):
+        return (minute - axis_start) * 100.0 / span
+
+    ticks = []
+    first_hour = axis_start // 60
+    for hour in range(first_hour, axis_end // 60 + 1):
+        ticks.append({
+            "label": f"{hour % 24:02d}:00", "left": pct(hour * 60),
+            "show": (hour - first_hour) % step == 0,
+        })
+
+    rows = []
+    for day_num, day_name in DAY_NAMES.items():
+        items = by_day[day_num]
+        segments = []
+        for item in items:
+            length = item["end"] - item["start"]
+            width = length * 100.0 / span
+            label = "Class" if item["kind"] == "class" else "Break"
+            start_label, end_label = _hhmm_from_minutes(item["start"]), _hhmm_from_minutes(item["end"])
+            segments.append({
+                "kind": item["kind"], "label": label,
+                "start_label": start_label, "end_label": end_label,
+                "length_label": _duration_text(length),
+                "left": pct(item["start"]), "width": width,
+                "show_text": width >= 6, "show_time": width >= 14,
+                "tooltip": f"{label} {start_label}–{end_label} ({_duration_text(length)})",
+            })
+        breaks = [i for i in items if i["kind"] == "break"]
+        row = {
+            "day_num": day_num, "day_name": day_name, "is_today": day_num == today_num,
+            "segments": segments, "has_timetable": bool(items), "break_count": len(breaks),
+            "range_label": (f"{_hhmm_from_minutes(items[0]['start'])}–{_hhmm_from_minutes(max(i['end'] for i in items))}"
+                            if items else "No timetable"),
+            "breaks_label": " • ".join(
+                f"{_hhmm_from_minutes(b['start'])}–{_hhmm_from_minutes(b['end'])}" for b in breaks),
+        }
+        if day_num == today_num and axis_start <= now_min <= axis_end:
+            row["now_left"] = pct(now_min)
+        rows.append(row)
+
+    return {
+        "axis": {"hours": hours, "ticks": ticks,
+                 "start_label": _hhmm_from_minutes(axis_start),
+                 "end_label": _hhmm_from_minutes(axis_end)},
+        "rows": rows,
+        "today": rows[today_num - 1],
+        "now_label": f"{now.hour:02d}:{now.minute:02d}",
+        "now_info": describe_now(slots, exceptions, now),
+    }
+    
+
+# ---------------------------------------------------------------- day timeline
+
+def build_day_timeline(slots, day_num, now=None):
+    """One day's timeline scaled to that day's own hours, with boundary-time labels."""
+    now = now or datetime.now()
+    day_name = DAY_NAMES.get(day_num, "")
+    items = _collect_slots(slots).get(day_num, [])
+    if not items:
+        return {"day_name": day_name, "has_timetable": False, "segments": [],
+                "labels": [], "summary": "No timetable saved"}
+
+    start = items[0]["start"]
+    end = max(i["end"] for i in items)
+    span = max(1, end - start)
+
+    parts = []
+    cursor = start
+    for item in items:
+        if item["start"] > cursor:
+            parts.append({"kind": "gap", "start": cursor, "end": item["start"]})
+        parts.append({"kind": item["kind"], "start": item["start"], "end": item["end"]})
+        cursor = max(cursor, item["end"])
+
+    segments = []
+    boundaries = {start, end}
+    for part in parts:
+        length = part["end"] - part["start"]
+        width = length * 100.0 / span
+        kind = part["kind"]
+        boundaries.update((part["start"], part["end"]))
+        segments.append({
+            "kind": kind,
+            "label": {"class": "Not allowed", "break": "Allowed"}.get(kind, "No slot"),
+            "name": {"class": "Class", "break": "Break"}.get(kind, "Gap"),
+            "start_label": _hhmm_from_minutes(part["start"]),
+            "end_label": _hhmm_from_minutes(part["end"]),
+            "length_label": _duration_text(length),
+            "left": (part["start"] - start) * 100.0 / span,
+            "width": width,
+            "show_text": width >= 9,
+            "show_length": width >= 15,
+        })
+
+    labels = []
+    previous_left = None
+    level = 0
+    ordered = sorted(boundaries)
+    for index, minute in enumerate(ordered):
+        left = (minute - start) * 100.0 / span
+        if previous_left is not None and left - previous_left < 8:
+            level = 1 - level          # stagger close labels so they never overlap
+        else:
+            level = 0
+        previous_left = left
+        if index == 0:
+            align = "start"
+        elif index == len(ordered) - 1:
+            align = "end"
+        else:
+            align = "center"
+        labels.append({"text": _hhmm_from_minutes(minute), "left": left,
+                       "level": level, "align": align})
+
+    now_min = now.hour * 60 + now.minute
+    is_today = day_num == now.isoweekday()
+    now_left = (now_min - start) * 100.0 / span if is_today and start <= now_min <= end else None
+    break_count = len([p for p in parts if p["kind"] == "break"])
+    return {
+        "day_name": day_name, "has_timetable": True, "is_today": is_today,
+        "segments": segments, "labels": labels,
+        "now_left": now_left, "now_label": f"{now.hour:02d}:{now.minute:02d}",
+        "summary": (f"{_hhmm_from_minutes(start)}–{_hhmm_from_minutes(end)} • "
+                    f"{break_count} break{'' if break_count == 1 else 's'}"),
+    }
+
+
+def build_week_summary(slots, now=None):
+    """One row per weekday for the summary table."""
+    now = now or datetime.now()
+    by_day = _collect_slots(slots)
+    rows = []
+    for day_num, day_name in DAY_NAMES.items():
+        items = by_day[day_num]
+        breaks = [i for i in items if i["kind"] == "break"]
+        class_minutes = sum(i["end"] - i["start"] for i in items if i["kind"] == "class")
+        rows.append({
+            "day_num": day_num, "day_name": day_name,
+            "is_today": day_num == now.isoweekday(),
+            "has_timetable": bool(items),
+            "range_label": (f"{_hhmm_from_minutes(items[0]['start'])}–"
+                            f"{_hhmm_from_minutes(max(i['end'] for i in items))}") if items else "No timetable",
+            "break_count": len(breaks),
+            "breaks": [f"{_hhmm_from_minutes(b['start'])}–{_hhmm_from_minutes(b['end'])}" for b in breaks],
+            "class_label": _duration_text(class_minutes) if class_minutes else "—",
+        })
+    return rows
