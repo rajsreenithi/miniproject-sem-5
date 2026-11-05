@@ -1,0 +1,111 @@
+"""YOLOv8 person detection and persistent ByteTrack tracking."""
+
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+from numpy.typing import NDArray
+from ultralytics import YOLO
+
+from engine.tracker import Track
+
+
+Frame = NDArray[np.uint8]
+
+
+class PersonDetector:
+    """Detect and track people in video frames using YOLOv8."""
+
+    def __init__(
+        self,
+        weights: str | Path = "yolov8n.pt",
+        conf: float = 0.25,
+        imgsz: int = 960,
+        tracker: str = "bytetrack.yaml",
+        device: str | int | None = None,
+    ) -> None:
+        """Initialize the YOLO model and tracking configuration."""
+        if not 0.0 <= conf <= 1.0:
+            raise ValueError("conf must be between 0 and 1")
+
+        if imgsz <= 0:
+            raise ValueError("imgsz must be positive")
+
+        self.conf = conf
+        self.imgsz = imgsz
+        self.tracker = tracker
+        self.device = device
+        self.model = YOLO(str(weights))
+
+    def process(self, frame: Frame) -> list[Track]:
+        """Return tracked people detected in a BGR image."""
+        if frame is None or frame.size == 0:
+            raise ValueError("frame must be a non-empty image")
+
+        options: dict[str, Any] = {
+            "source": frame,
+            "persist": True,
+            "classes": [0],
+            "conf": self.conf,
+            "imgsz": self.imgsz,
+            "tracker": self.tracker,
+            "verbose": False,
+        }
+
+        if self.device is not None:
+            options["device"] = self.device
+
+        results = self.model.track(**options)
+
+        tracks: list[Track] = []
+
+        if not results:
+            return tracks
+
+        boxes = results[0].boxes
+
+        if boxes is None or len(boxes) == 0:
+            return tracks
+
+        coordinates = boxes.xyxy.cpu().numpy()
+        confidences = boxes.conf.cpu().numpy()
+
+        if boxes.id is None:
+            # Do not invent IDs when ByteTrack has not assigned them.
+            return tracks
+
+        track_ids = boxes.id.int().cpu().tolist()
+
+        for box, track_id, confidence in zip(
+            coordinates,
+            track_ids,
+            confidences,
+        ):
+            x1, y1, x2, y2 = box.tolist()
+
+            bbox = (
+                int(round(x1)),
+                int(round(y1)),
+                int(round(x2)),
+                int(round(y2)),
+            )
+
+            foot_point = (
+                (x1 + x2) / 2.0,
+                y2,
+            )
+
+            tracks.append(
+                Track(
+                    track_id=int(track_id),
+                    bbox=bbox,
+                    foot_point=foot_point,
+                    confidence=float(confidence),
+                )
+            )
+
+        return tracks
+
+    def reset_tracking(self) -> None:
+        """Reset tracker state before starting an independent video ."""
+        self.model.predictor = None
