@@ -1,0 +1,582 @@
+B.22  Live View Page
+File: web/templates/live.html
+{% extends "base.html" %}
+{% block head %}<meta http-equiv="refresh" content="5">{% endblock %}
+
+{% block content %}
+<div class="container-fluid py-3">
+  <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-4">
+    <div>
+      <h2 class="mb-1">Live cameras</h2>
+      <p class="text-muted mb-0">Latest processed camera frame</p>
+    </div>
+    <form method="get" action="{{ url_for('dashboard_pages.live') }}" class="d-flex gap-2">
+      <select name="camera_id" class="form-select" aria-label="Select camera" {% if not cameras %}disabled{% endif %}>
+        {% for item in cameras %}
+          <option value="{{ item.camera_id }}"
+                  {% if camera and item.camera_id == camera.camera_id %}selected{% endif %}>
+            {{ item.name }}{% if item.floor_label %} — {{ item.floor_label }}{% endif %}
+          </option>
+        {% endfor %}
+      </select>
+      <button class="btn btn-primary" type="submit" {% if not cameras %}disabled{% endif %}>View</button>
+    </form>
+  </div>
+
+  <div class="card shadow-sm">
+    <div class="card-header bg-white d-flex flex-wrap justify-content-between align-items-center gap-2">
+      <h5 class="mb-0">{{ camera.name if camera else "No camera selected" }}</h5>
+      {% if camera %}
+        {% if camera.is_active %}
+          <span class="badge bg-success">Enabled</span>
+        {% else %}
+          <span class="badge bg-secondary">Disabled</span>
+        {% endif %}
+      {% endif %}
+    </div>
+    <div class="card-body">
+      {% if not camera %}
+        <div class="text-center text-muted py-5">
+          <h5>No cameras configured</h5>
+          <p class="mb-0">Add a camera for this site to view its frames.</p>
+        </div>
+      {% elif image_exists %}
+        <img class="img-fluid rounded border w-100"
+     src="{{ url_for('dashboard_pages.live_frame', camera_id=camera.camera_id) }}"
+     alt="Latest frame from {{ camera.name }}">
+        <div class="d-flex justify-content-between flex-wrap gap-2 mt-3">
+          <span class="text-muted small">Frame file: camera_{{ camera.camera_id }}.jpg</span>
+          <a class="btn btn-outline-primary btn-sm"
+             href="{{ url_for('dashboard_pages.live_snapshot', camera_id=camera.camera_id) }}">
+            Download snapshot
+          </a>
+        </div>
+      {% else %}
+        <div class="text-center text-muted py-5">
+          <h5>Camera frame unavailable</h5>
+          <p class="mb-0">Start the worker and check that it writes the latest frame to <code>data/live/</code>.</p>
+        </div>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endblock %}
+B.23  Incidents Page
+File: web/templates/incidents.html
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container-fluid py-3">
+  <div class="mb-4">
+    <h2 class="mb-1">Incidents</h2>
+    <p class="text-muted mb-0">Review rule incidents and alert delivery counts.</p>
+  </div>
+
+  <div class="card shadow-sm mb-4">
+    <div class="card-body">
+      <form method="get" class="row g-3 align-items-end">
+        <div class="col-12 col-md-3">
+          <label class="form-label" for="start">From date</label>
+          <input class="form-control" id="start" type="date" name="start" value="{{ start_value }}">
+        </div>
+        <div class="col-12 col-md-3">
+          <label class="form-label" for="end">To date</label>
+          <input class="form-control" id="end" type="date" name="end" value="{{ end_value }}">
+        </div>
+        <div class="col-12 col-md-3">
+          <label class="form-label" for="status">Status</label>
+          <select class="form-select" id="status" name="status">
+            <option value="">All statuses</option>
+            <option value="open" {% if status == "open" %}selected{% endif %}>Open</option>
+            <option value="closed" {% if status == "closed" %}selected{% endif %}>Closed</option>
+          </select>
+        </div>
+        <div class="col-12 col-md-3 d-flex gap-2">
+          <button class="btn btn-primary" type="submit">Apply filters</button>
+          <a class="btn btn-outline-secondary" href="{{ url_for('dashboard_pages.incidents') }}">Reset</a>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div class="card shadow-sm mb-4">
+    <div class="card-header bg-white"><h5 class="mb-0">Incident history</h5></div>
+    <div class="table-responsive">
+      <table class="table table-striped table-hover align-middle mb-0">
+        <thead>
+          <tr>
+            <th>ID</th><th>Started</th><th>Camera / floor</th><th>Rule</th>
+            <th>Peak</th><th>Duration (sec)</th><th>Status</th><th>Alerts</th><th>Details</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for item in incidents %}
+            <tr>
+              <td>{{ item.incident_id }}</td>
+              <td>{{ item.started_at|datetime_display }}</td>
+              <td>
+                {{ item.camera_name }}
+                {% if item.floor_label %}<div class="small text-muted">{{ item.floor_label }}</div>{% endif %}
+              </td>
+              <td>{{ item.rule_type|replace("_", " ")|title }}</td>
+              <td>{{ item.peak_count }}</td>
+              <td>{{ item.duration_sec if item.duration_sec is not none else "—" }}</td>
+              <td>
+                {% if item.status == "open" %}
+                  <span class="badge bg-danger">Open</span>
+                {% else %}
+                  <span class="badge bg-success">Closed</span>
+                {% endif %}
+              </td>
+              <td>{{ item.alert_count }}</td>
+              <td>
+                <button class="btn btn-sm btn-outline-primary" type="button"
+                        data-bs-toggle="modal"
+                        data-bs-target="#incident-{{ item.incident_id }}">
+                  Details
+                </button>
+              </td>
+            </tr>
+          {% else %}
+            <tr>
+              <td colspan="9" class="text-center text-muted py-5">
+                No incidents match these filters.
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  {% for item in incidents %}
+    <div class="modal fade" id="incident-{{ item.incident_id }}" tabindex="-1"
+         aria-labelledby="incident-label-{{ item.incident_id }}" aria-hidden="true">
+      <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h5 class="modal-title" id="incident-label-{{ item.incident_id }}">
+              Incident #{{ item.incident_id }}
+            </h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+          </div>
+          <div class="modal-body">
+            <dl class="row mb-0">
+              <dt class="col-5">Camera</dt><dd class="col-7">{{ item.camera_name }}</dd>
+              <dt class="col-5">Floor</dt><dd class="col-7">{{ item.floor_label or "—" }}</dd>
+              <dt class="col-5">Rule</dt><dd class="col-7">{{ item.rule_type|replace("_", " ")|title }}</dd>
+              <dt class="col-5">Started</dt><dd class="col-7">{{ item.started_at|datetime_display }}</dd>
+              <dt class="col-5">Ended</dt><dd class="col-7">{{ item.ended_at|datetime_display if item.ended_at else "Still open" }}</dd>
+              <dt class="col-5">Duration</dt><dd class="col-7">{{ item.duration_sec if item.duration_sec is not none else "—" }} seconds</dd>
+              <dt class="col-5">Peak count</dt><dd class="col-7">{{ item.peak_count }}</dd>
+              <dt class="col-5">Incident status</dt><dd class="col-7">{{ item.status|title }}</dd>
+              <dt class="col-5">Alert records</dt><dd class="col-7">{{ item.alert_count }}</dd>
+            </dl>
+          </div>
+          <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  {% endfor %}
+
+  <div class="card shadow-sm">
+    <div class="card-header bg-white"><h5 class="mb-0">Busiest incident hours</h5></div>
+    <div class="card-body">
+      {% if worst_hours %}
+        {% for item in worst_hours %}
+          <div class="mb-3">
+            <div class="d-flex justify-content-between mb-1">
+              <span>{{ "%02d"|format(item.hour) }}:00–{{ "%02d"|format((item.hour + 1) % 24) }}:00</span>
+              <strong>{{ item.total }}</strong>
+            </div>
+            <div class="progress" style="height: 8px;">
+              <div class="progress-bar bg-warning"
+                   style="width: {{ ((item.total / max_worst) * 100)|int if max_worst else 0 }}%"></div>
+            </div>
+          </div>
+        {% endfor %}
+      {% else %}
+        <div class="text-center text-muted py-4">No incident activity for this date range.</div>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endblock %}
+B.24  Heatmap Page
+File: web/templates/heatmap.html
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container-fluid py-3">
+  <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-4">
+    <div>
+      <h2 class="mb-1">Heatmap</h2>
+      <p class="text-muted mb-0">View accumulated person movement for a camera.</p>
+    </div>
+    <form method="get" action="{{ url_for('dashboard_pages.heatmap') }}" class="d-flex gap-2">
+      <select class="form-select" name="camera_id" aria-label="Select camera" {% if not cameras %}disabled{% endif %}>
+        {% for item in cameras %}
+          <option value="{{ item.camera_id }}"
+                  {% if camera and item.camera_id == camera.camera_id %}selected{% endif %}>
+            {{ item.name }}{% if item.floor_label %} — {{ item.floor_label }}{% endif %}
+          </option>
+        {% endfor %}
+      </select>
+      <button class="btn btn-primary" type="submit" {% if not cameras %}disabled{% endif %}>View</button>
+    </form>
+  </div>
+
+  <div class="card shadow-sm">
+    <div class="card-header bg-white">
+      <h5 class="mb-0">{{ camera.name if camera else "No camera selected" }}</h5>
+    </div>
+    <div class="card-body">
+      {% if not camera %}
+        <div class="text-center text-muted py-5">
+          <h5>No cameras configured</h5>
+          <p class="mb-0">Add a camera to view its heatmap.</p>
+        </div>
+      {% elif image_exists %}
+        <img class="img-fluid w-100 rounded border"
+             src="{{ url_for('dashboard_pages.heatmap_image', camera_id=camera.camera_id) }}"
+             alt="Movement heatmap for {{ camera.name }}">
+      {% else %}
+        <div class="text-center text-muted py-5">
+          <h5>Heatmap not available yet</h5>
+          <p class="mb-0">Run the worker and check for <code>data/heatmaps/camera_{{ camera.camera_id }}.png</code>.</p>
+        </div>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endblock %}
+B.25  Reports Page
+File: web/templates/reports.html
+{% extends "base.html" %}
+
+{% block title %}Reports{% endblock %}
+
+{% block head %}
+<style>
+  .report-kpi { border: 1px solid #e4e7ec; border-radius: .75rem; padding: 1rem; height: 100%; background: #fff; }
+  .report-kpi .label { color: #667085; font-size: .8rem; margin-bottom: .35rem; }
+  .report-kpi .value { font-size: 1.45rem; font-weight: 700; line-height: 1.25; overflow-wrap: anywhere; }
+  .report-summary { border-left: 4px solid {{ report.theme }}; background: #f8fafc; border-radius: .5rem; padding: 1rem 1.1rem; }
+  .report-chart { display: block; width: 100%; max-width: 900px; height: auto; margin: .5rem auto 1rem; border: 1px solid #e4e7ec; border-radius: .5rem; }
+  @media print { .sidebar, .topbar, .page-footer, .report-controls, .nav-tabs, .btn, .flash-stack { display: none !important; } .main-area, .content-area { margin: 0 !important; padding: 0 !important; } .tab-pane { display: block !important; opacity: 1 !important; } .tab-pane:not(.active) { display: block !important; } .card { break-inside: avoid; box-shadow: none !important; } }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="container-fluid py-3 report-page">
+  <div class="d-flex flex-wrap justify-content-between align-items-start gap-3 mb-4">
+    <div>
+      <h2 class="mb-1">Reports</h2>
+      <p class="text-muted mb-0">PDF is the primary report output{% if site %} • {{ site.name }}{% endif %}</p>
+    </div>
+    <div class="d-flex flex-wrap gap-2 report-controls">
+      <a class="btn btn-primary" href="{{ url_for('dashboard_pages.report_pdf', **{'from': start_value, 'to': end_value}) }}">Download PDF</a>
+      <a class="btn btn-outline-primary" href="{{ url_for('dashboard_pages.export_report_csv', **{'from': start_value, 'to': end_value}) }}">Export data (CSV)</a>
+      <a class="btn btn-outline-secondary" target="_blank" rel="noopener" href="{{ url_for('dashboard_pages.print_report', **{'from': start_value, 'to': end_value}) }}">Print</a>
+    </div>
+  </div>
+
+  <div class="card shadow-sm mb-4 report-controls">
+    <div class="card-body">
+      <form method="get" action="{{ url_for('dashboard_pages.reports') }}">
+        <div class="d-flex flex-wrap gap-2 mb-3" role="group" aria-label="Quick report ranges">
+          <button class="btn {{ 'btn-primary' if preset == 'today' else 'btn-outline-primary' }}" name="range" value="today" type="submit">Today</button>
+          <button class="btn {{ 'btn-primary' if preset == 'yesterday' else 'btn-outline-primary' }}" name="range" value="yesterday" type="submit">Yesterday</button>
+          <button class="btn {{ 'btn-primary' if preset == 'last7' else 'btn-outline-primary' }}" name="range" value="last7" type="submit">Last 7 days</button>
+        </div>
+        <div class="row g-3 align-items-end">
+          <div class="col-12 col-md-4">
+            <label class="form-label" for="from-date">From</label>
+            <input class="form-control" id="from-date" type="date" name="from" value="{{ start_value }}" required>
+          </div>
+          <div class="col-12 col-md-4">
+            <label class="form-label" for="to-date">To</label>
+            <input class="form-control" id="to-date" type="date" name="to" value="{{ end_value }}" required>
+          </div>
+          <div class="col-12 col-md-4">
+            <button class="btn btn-dark" type="submit" name="range" value="custom">Apply custom range</button>
+          </div>
+        </div>
+      </form>
+      {% if date_error %}<div class="alert alert-danger mt-3 mb-0">{{ date_error }}</div>{% endif %}
+    </div>
+  </div>
+
+  {% if not site %}
+    <div class="alert alert-warning">Select a site to preview or download a report.</div>
+  {% else %}
+    <div class="d-flex flex-wrap justify-content-between align-items-center mb-3">
+      <div><h4 class="mb-1">{{ site.name }}</h4><div class="text-muted small">{{ start_date.strftime('%d %b %Y') }} – {{ end_date.strftime('%d %b %Y') }} • {{ site.site_type|replace('_', ' ')|title }}</div></div>
+      <span class="badge text-bg-light border">{{ report.incident_count }} incidents</span>
+    </div>
+
+    <ul class="nav nav-tabs report-controls" id="reportTabs" role="tablist">
+      <li class="nav-item" role="presentation"><button class="nav-link active" id="summary-tab" data-bs-toggle="tab" data-bs-target="#summary-panel" type="button" role="tab" aria-controls="summary-panel" aria-selected="true">Summary</button></li>
+      <li class="nav-item" role="presentation"><button class="nav-link" id="incidents-tab" data-bs-toggle="tab" data-bs-target="#incidents-panel" type="button" role="tab" aria-controls="incidents-panel" aria-selected="false">Incidents</button></li>
+      <li class="nav-item" role="presentation"><button class="nav-link" id="charts-tab" data-bs-toggle="tab" data-bs-target="#charts-panel" type="button" role="tab" aria-controls="charts-panel" aria-selected="false">Charts</button></li>
+    </ul>
+
+    <div class="tab-content border border-top-0 bg-white rounded-bottom p-3 p-lg-4" id="reportTabContent">
+      <section class="tab-pane fade show active" id="summary-panel" role="tabpanel" aria-labelledby="summary-tab" tabindex="0">
+        <h5 class="mb-3">Plain-language summary</h5>
+        <div class="report-summary mb-4">
+          {% for sentence in report.summary_sentences %}<p class="mb-2">{{ sentence }}</p>{% endfor %}
+        </div>
+        <div class="row g-3">
+          {% if site.site_type == 'water_point' %}
+            <div class="col-6 col-xl"><div class="report-kpi"><div class="label">Violations</div><div class="value">{{ report.violations }}</div></div></div>
+            <div class="col-6 col-xl"><div class="report-kpi"><div class="label">Violation minutes</div><div class="value">{{ (report.violation_seconds / 60)|round(1) }}</div></div></div>
+            <div class="col-6 col-xl"><div class="report-kpi"><div class="label">Longest gathering</div><div class="value">{{ report.longest_seconds|duration }}</div></div></div>
+            <div class="col-6 col-xl"><div class="report-kpi"><div class="label">Peak count</div><div class="value">{{ report.peak_count }}</div></div></div>
+            <div class="col-6 col-xl"><div class="report-kpi"><div class="label">Class-time compliance</div><div class="value">{{ ('%.1f%%'|format(report.compliance_pct)) if report.compliance_pct is not none else 'N/A' }}</div></div></div>
+          {% else %}
+            <div class="col-6 col-xl"><div class="report-kpi"><div class="label">Entries</div><div class="value">{{ report.entries }}</div></div></div>
+            <div class="col-6 col-xl"><div class="report-kpi"><div class="label">Exits</div><div class="value">{{ report.exits }}</div></div></div>
+            <div class="col-6 col-xl"><div class="report-kpi"><div class="label">Average dwell</div><div class="value">{{ report.average_dwell_sec|duration }}</div></div></div>
+            <div class="col-6 col-xl"><div class="report-kpi"><div class="label">Busiest hour</div><div class="value">{{ ('%02d:00'|format(report.busiest_hour)) if report.busiest_hour is not none else '—' }}</div></div></div>
+            <div class="col-6 col-xl"><div class="report-kpi"><div class="label">Incidents</div><div class="value">{{ report.incident_count }}</div></div></div>
+          {% endif %}
+        </div>
+        <p class="text-muted small mt-4 mb-0">Generated {{ report.generated_at.strftime('%d %b %Y, %H:%M:%S') }}. AuraVision stores counts and timings only, never faces or identities.</p>
+      </section>
+
+      <section class="tab-pane fade" id="incidents-panel" role="tabpanel" aria-labelledby="incidents-tab" tabindex="0">
+        <div class="d-flex justify-content-between align-items-center mb-3"><h5 class="mb-0">Incident history</h5><span class="text-muted small">{{ report.incidents|length }} rows</span></div>
+        <div class="table-responsive">
+          <table class="table table-striped table-hover align-middle">
+            <thead><tr><th>Start</th><th>End</th><th>Duration</th><th>Peak</th><th>Floor</th><th>Alert status</th></tr></thead>
+            <tbody>
+              {% for item in report.incidents %}
+              <tr>
+                <td>{{ item.started_at|datetime_display }}</td><td>{{ item.ended_at|datetime_display if item.ended_at else 'Open' }}</td>
+                <td>{{ item.duration_human }}</td><td>{{ item.peak_count }}</td><td>{{ item.floor_label or item.camera_name or '—' }}</td><td>{{ item.alert_status or 'No alerts' }}</td>
+              </tr>
+              {% else %}<tr><td colspan="6" class="text-center text-muted py-4">No incidents recorded for this period.</td></tr>{% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="tab-pane fade" id="charts-panel" role="tabpanel" aria-labelledby="charts-tab" tabindex="0">
+        <h5>Hourly activity</h5>
+        <img class="report-chart" src="{{ url_for('dashboard_pages.report_chart', chart='hourly', **{'from': start_value, 'to': end_value}) }}" alt="Hourly activity chart">
+        <h5>Incidents by time slot or weekday</h5>
+        <img class="report-chart" src="{{ url_for('dashboard_pages.report_chart', chart='incidents', **{'from': start_value, 'to': end_value}) }}" alt="Incidents by time slot or weekday chart">
+        {% if report.heatmap_path %}<p class="text-muted small">Heatmap source: camera image last updated {{ report.heatmap_date.strftime('%d %b %Y, %H:%M') if report.heatmap_date else 'date unavailable' }}. The PDF includes the available heatmap and a low-to-high legend.</p>{% else %}<p class="text-muted small">No saved camera heatmap is available for this site; the PDF will omit that section.</p>{% endif %}
+      </section>
+    </div>
+  {% endif %}
+</div>
+{% endblock %}
+B.26  Schedule Page
+File: web/templates/schedule.html
+{% extends "base.html" %}
+{% block title %}Daily timetable{% endblock %}
+{% block head %}
+<style>
+.now-banner{display:flex;gap:.9rem;align-items:flex-start;padding:1rem 1.25rem;border-radius:14px;border:1px solid;margin-bottom:1.25rem}
+.now-banner strong{display:block;font-size:1.05rem}.now-banner span.detail{display:block;opacity:.85;font-size:.92rem}
+.now-banner.state-class{background:#fef2f2;border-color:#fecaca;color:#7f1d1d}
+.now-banner.state-break{background:#ecfdf5;border-color:#a7f3d0;color:#065f46}
+.now-banner.state-outside{background:#f3f4f6;border-color:#e5e7eb;color:#374151}
+.now-banner.state-holiday{background:#eff6ff;border-color:#bfdbfe;color:#1e3a8a}
+.now-dot{width:12px;height:12px;border-radius:50%;background:currentColor;margin-top:.4rem;flex:none;animation:nowpulse 1.8s infinite}
+@keyframes nowpulse{0%{box-shadow:0 0 0 0 rgba(0,0,0,.25)}70%{box-shadow:0 0 0 9px rgba(0,0,0,0)}100%{box-shadow:0 0 0 0 rgba(0,0,0,0)}}
+
+.tl2-scroll{overflow-x:auto;padding:0 4px 6px}.tl2{min-width:640px;padding:0 34px}
+.tl2-labels{position:relative;height:46px}
+.tl2-label{position:absolute;font-size:.85rem;font-weight:700;color:#1f2937;white-space:nowrap}
+.tl2-label.lvl0{bottom:12px}.tl2-label.lvl1{bottom:30px}
+.tl2-label::after{content:"";position:absolute;width:1px;background:#64748b;top:100%}
+.tl2-label.lvl0::after{height:12px}.tl2-label.lvl1::after{height:30px}
+.tl2-label.start{transform:none}.tl2-label.start::after{left:0}
+.tl2-label.center{transform:translateX(-50%)}.tl2-label.center::after{left:50%}
+.tl2-label.end{transform:translateX(-100%)}.tl2-label.end::after{right:0}
+.tl2-strip{position:relative;height:70px;border:1.5px solid #334155;border-radius:10px;overflow:hidden;background:#f8fafc}
+.tl2-seg{position:absolute;top:0;bottom:0;display:flex;flex-direction:column;align-items:center;justify-content:center;overflow:hidden;white-space:nowrap;font-weight:700;font-size:.9rem;border-left:1.5px solid #334155}
+.tl2-seg:first-child{border-left:0}
+.tl2-seg small{font-weight:500;font-size:.75rem;opacity:.85}
+.tl2-seg.class{background:#fecaca;color:#7f1d1d}
+.tl2-seg.break{background:#bbf7d0;color:#14532d}
+.tl2-seg.gap{background:#e5e7eb;color:#4b5563}
+.tl2-nowline{position:absolute;top:0;bottom:0;width:2px;background:#dc2626;z-index:4}
+.tl2-nowrow{position:relative;height:26px}
+.tl2-nowtag{position:absolute;top:4px;transform:translateX(-50%);background:#dc2626;color:#fff;font-size:.75rem;font-weight:700;padding:.1rem .5rem;border-radius:6px;white-space:nowrap}
+.tl-legend{display:flex;flex-wrap:wrap;gap:1.25rem;margin:.25rem 0 .75rem;font-size:.9rem}
+.tl-legend i{display:inline-block;width:13px;height:13px;border-radius:3px;margin-right:.4rem;vertical-align:-2px}
+.tl-legend i.class{background:#fecaca}.tl-legend i.break{background:#bbf7d0;box-shadow:inset 0 0 0 1.5px #16a34a}.tl-legend i.gap{background:#e5e7eb}
+.day-editor{border:1px solid #dfe3e8;border-radius:14px;padding:1rem;background:#fff}
+.time-pair{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.75rem}
+.break-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.75rem}
+.field-error{color:#b42318;font-size:.82rem;margin-top:.25rem}
+@media(max-width:760px){.break-grid{grid-template-columns:1fr}.time-pair{gap:.5rem}}
+</style>
+{% endblock %}
+{% block content %}
+<div class="page-heading"><div><div class="breadcrumbs">Workspace <span>/</span> Schedule</div><h1>Daily timetable</h1><p>Water-point class periods, breaks, and holiday or exam exceptions.</p></div></div>
+
+{% if not site %}
+<section class="panel empty-state"><h3>No site selected</h3><p>Select a water-point site to view its timetable.</p></section>
+{% else %}
+{% set info = view.now_info %}
+<div class="now-banner state-{{ info.state }}" role="status">
+  <span class="now-dot"></span>
+  <div><strong>Right now ({{ view.now_label }}): {{ info.headline }}</strong><span class="detail">{{ info.detail }}</span></div>
+</div>
+{% if errors.general %}<div class="alert alert-danger">{{ errors.general }}</div>{% endif %}
+
+<section class="panel mb-4">
+  <form method="get" action="{{ url_for('admin.schedule') }}#timeline" class="row g-2 align-items-end">
+    <div class="col-sm-6 col-md-4">
+      <label class="form-label" for="day_select">Choose a day</label>
+      <select class="form-select" id="day_select" name="day">
+        {% for n, name in days %}<option value="{{ n }}" {% if n == selected_day %}selected{% endif %}>{{ name }}{% if n == today_num %} (today){% endif %}</option>{% endfor %}
+      </select>
+    </div>
+    <div class="col-auto"><button class="btn btn-primary" type="submit">Show</button></div>
+  </form>
+</section>
+
+<section class="panel mb-4" id="timeline">
+  <div class="panel-heading"><div><h2>{{ day_view.day_name }} timeline</h2><p>{{ day_view.summary }}</p></div></div>
+  {% if day_view.has_timetable %}
+  <div class="tl-legend"><span><i class="class"></i>Class — not allowed</span><span><i class="break"></i>Break — allowed</span>{% if day_view.segments|selectattr('kind','equalto','gap')|list %}<span><i class="gap"></i>No slot saved</span>{% endif %}</div>
+  <div class="tl2-scroll"><div class="tl2">
+    <div class="tl2-labels">
+      {% for l in day_view.labels %}<span class="tl2-label lvl{{ l.level }} {{ l.align }}" style="left:{{ '%.3f'|format(l.left) }}%">{{ l.text }}</span>{% endfor %}
+    </div>
+    <div class="tl2-strip" role="img" aria-label="{{ day_view.day_name }} timeline of class and break periods">
+      {% for s in day_view.segments %}
+      <div class="tl2-seg {{ s.kind }}" style="left:{{ '%.3f'|format(s.left) }}%;width:{{ '%.3f'|format(s.width) }}%" title="{{ s.name }} {{ s.start_label }}–{{ s.end_label }} ({{ s.length_label }}) — {{ s.label }}">
+        {% if s.show_text %}<span>{{ s.label }}</span>{% if s.show_length %}<small>{{ s.length_label }}</small>{% endif %}{% endif %}
+      </div>
+      {% endfor %}
+      {% if day_view.now_left is not none %}<i class="tl2-nowline" style="left:{{ '%.3f'|format(day_view.now_left) }}%"></i>{% endif %}
+    </div>
+    <div class="tl2-nowrow">{% if day_view.now_left is not none %}<span class="tl2-nowtag" style="left:{{ '%.3f'|format(day_view.now_left) }}%">▲ Now {{ day_view.now_label }}</span>{% endif %}</div>
+  </div></div>
+  {% if day_view.is_today and day_view.now_left is none %}<p class="text-muted small mb-3">The time now ({{ day_view.now_label }}) is outside today's college hours.</p>{% endif %}
+
+  <div class="table-responsive"><table class="table table-sm align-middle mb-0">
+    <thead><tr><th>Period</th><th>From</th><th>To</th><th>Length</th><th>Gathering</th></tr></thead>
+    <tbody>{% for s in day_view.segments %}<tr>
+      <td>{{ s.name }}</td><td>{{ s.start_label }}</td><td>{{ s.end_label }}</td><td>{{ s.length_label }}</td>
+      <td>{% if s.kind == 'class' %}<span class="badge text-bg-danger">Not allowed</span>{% elif s.kind == 'break' %}<span class="badge text-bg-success">Allowed</span>{% else %}<span class="badge text-bg-secondary">No slot</span>{% endif %}</td>
+    </tr>{% endfor %}</tbody>
+  </table></div>
+  {% else %}
+  <div class="table-empty"><strong>No timetable saved for {{ day_view.day_name }}</strong><span>Use the editor below to add the college hours and up to 3 breaks.</span></div>
+  {% endif %}
+</section>
+
+{% if can_edit %}
+<section class="panel mb-4" id="editor">
+  <div class="panel-heading"><div><h2>Edit {{ day_view.day_name }}</h2><p>Set the college hours and up to 3 breaks. Class periods are created automatically between the breaks.</p></div></div>
+  {% set prefix = 'day_' ~ selected_day ~ '_' %}
+  <form class="day-editor" method="post" action="{{ url_for('admin.schedule') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="action" value="save_day">
+    <input type="hidden" name="day_of_week" value="{{ selected_day }}">
+    <div class="time-pair mb-3">
+      <div><label class="form-label" for="{{ prefix }}start">College day starts</label>
+        <input class="form-control" id="{{ prefix }}start" type="time" name="{{ prefix }}start" value="{{ form_values.get(prefix ~ 'start','') }}" required>
+        {% if errors.get(prefix ~ 'start') %}<div class="field-error">{{ errors.get(prefix ~ 'start') }}</div>{% endif %}</div>
+      <div><label class="form-label" for="{{ prefix }}end">College day ends</label>
+        <input class="form-control" id="{{ prefix }}end" type="time" name="{{ prefix }}end" value="{{ form_values.get(prefix ~ 'end','') }}" required>
+        {% if errors.get(prefix ~ 'end') %}<div class="field-error">{{ errors.get(prefix ~ 'end') }}</div>{% endif %}</div>
+    </div>
+    <h3 class="h6">Optional breaks (up to 3)</h3>
+    <div class="break-grid">
+      {% for n in [1,2,3] %}{% set bp = prefix ~ 'break_' ~ n ~ '_' %}
+      <div class="border rounded-3 p-3">
+        <div class="fw-semibold mb-2">Break {{ n }}</div>
+        <label class="form-label" for="{{ bp }}start">Start</label>
+        <input class="form-control mb-1" id="{{ bp }}start" type="time" name="{{ bp }}start" value="{{ form_values.get(bp ~ 'start','') }}">
+        {% if errors.get(bp ~ 'start') %}<div class="field-error">{{ errors.get(bp ~ 'start') }}</div>{% endif %}
+        <label class="form-label mt-2" for="{{ bp }}end">End</label>
+        <input class="form-control" id="{{ bp }}end" type="time" name="{{ bp }}end" value="{{ form_values.get(bp ~ 'end','') }}">
+        {% if errors.get(bp ~ 'end') %}<div class="field-error">{{ errors.get(bp ~ 'end') }}</div>{% endif %}
+      </div>
+      {% endfor %}
+    </div>
+    <fieldset class="mt-3">
+      <legend class="fs-6">Also apply this timetable to</legend>
+      <div class="d-flex flex-wrap gap-3">
+        {% for n, name in days %}{% if n != selected_day %}<label class="form-check-label"><input class="form-check-input me-1" type="checkbox" name="apply_{{ n }}" value="1"> {{ name }}</label>{% endif %}{% endfor %}
+      </div>
+      <div class="form-text">Checked days are replaced with this timetable when you save.</div>
+    </fieldset>
+    <div class="d-flex flex-wrap gap-2 mt-3">
+      <button class="btn btn-primary" type="submit">Save {{ day_view.day_name }}</button>
+      <button class="btn btn-outline-danger" type="button" data-bs-toggle="modal" data-bs-target="#clearDayModal">Clear this day</button>
+    </div>
+  </form>
+
+  <div class="modal fade" id="clearDayModal" tabindex="-1" aria-labelledby="clearDayLabel" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered"><div class="modal-content">
+      <form method="post" action="{{ url_for('admin.schedule') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <input type="hidden" name="action" value="clear_day">
+        <input type="hidden" name="day_of_week" value="{{ selected_day }}">
+        <div class="modal-header"><h5 class="modal-title" id="clearDayLabel">Clear {{ day_view.day_name }}?</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+        <div class="modal-body">This removes every class and break slot for {{ day_view.day_name }}. With no timetable, no restrictions apply on that day.</div>
+        <div class="modal-footer"><button type="button" class="btn btn-light" data-bs-dismiss="modal">Cancel</button><button type="submit" class="btn btn-danger">Clear day</button></div>
+      </form>
+    </div></div>
+  </div>
+</section>
+{% else %}
+<div class="alert alert-secondary">Read-only view. Only HOD and admin accounts can edit the timetable.</div>
+{% endif %}
+
+<section class="panel mb-4">
+  <div class="panel-heading"><div><h2>Weekly summary</h2><p>College hours and breaks for every day. Choose "Open" to see a day's timeline.</p></div></div>
+  <div class="table-responsive"><table class="table table-hover align-middle mb-0">
+    <thead><tr><th>Day</th><th>College hours</th><th>Breaks</th><th>Class time</th><th></th></tr></thead>
+    <tbody>
+    {% for row in week_summary %}
+    <tr{% if row.day_num == selected_day %} class="table-active"{% endif %}>
+      <td><strong>{{ row.day_name }}</strong>{% if row.is_today %} <span class="badge text-bg-primary">Today</span>{% endif %}</td>
+      <td>{{ row.range_label }}</td>
+      <td>{% if row.break_count %}{{ row.breaks|join(' • ') }}{% else %}{{ '—' if row.has_timetable else '' }}{% endif %}</td>
+      <td>{{ row.class_label }}</td>
+      <td class="text-end"><a class="btn btn-sm btn-outline-primary" href="{{ url_for('admin.schedule', day=row.day_num, _anchor='timeline') }}">Open</a></td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+</section>
+
+<section class="panel"><div class="panel-heading"><div><h2>Holiday and exam exceptions</h2><p>Date-specific overrides stay separate from the weekly timetable.</p></div></div>
+{% if can_edit %}<form method="post" action="{{ url_for('admin.schedule') }}" class="border rounded-3 p-3 mb-3"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="action" value="exception_add"><div class="row g-2 align-items-end"><div class="col-md-3"><label class="form-label">Date</label><input class="form-control" type="date" name="on_date" required></div><div class="col-md-3"><label class="form-label">Mode</label><select class="form-select" name="mode" required><option value="unrestricted">Unrestricted (holiday)</option><option value="restricted">Restricted (exam)</option></select></div><div class="col-md-4"><label class="form-label">Note</label><input class="form-control" name="note" maxlength="150" placeholder="Holiday or exam name"></div><div class="col-md-2"><button class="btn btn-outline-primary w-100" type="submit">Add exception</button></div></div></form>{% endif %}
+<div class="table-responsive"><table class="table table-hover align-middle"><thead><tr><th>Date</th><th>Mode</th><th>Note</th>{% if can_edit %}<th>Actions</th>{% endif %}</tr></thead><tbody>
+{% for e in exceptions %}<tr><td>{{ e.on_date|date_display }}</td><td>{{ e.mode|title }}</td><td>{{ e.note or '—' }}</td>{% if can_edit %}<td>
+<form method="post" action="{{ url_for('admin.schedule') }}" class="d-flex flex-wrap gap-2 align-items-center"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="action" value="exception_edit"><input type="hidden" name="exception_id" value="{{ e.exception_id }}"><input class="form-control form-control-sm" style="max-width:145px" type="date" name="on_date" value="{{ e.on_date.isoformat() if e.on_date.isoformat is defined else e.on_date }}" required><select class="form-select form-select-sm" style="max-width:150px" name="mode"><option value="unrestricted" {% if e.mode=='unrestricted' %}selected{% endif %}>Unrestricted</option><option value="restricted" {% if e.mode=='restricted' %}selected{% endif %}>Restricted</option></select><input class="form-control form-control-sm" style="max-width:170px" name="note" maxlength="150" value="{{ e.note or '' }}" aria-label="Exception note"><button class="btn btn-sm btn-outline-primary" type="submit">Update</button></form>
+<form method="post" action="{{ url_for('admin.schedule') }}" class="mt-2"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="action" value="exception_delete"><input type="hidden" name="exception_id" value="{{ e.exception_id }}"><button class="btn btn-sm btn-outline-danger" type="submit">Delete</button></form>
+</td>{% endif %}</tr>{% else %}<tr><td colspan="{{ 4 if can_edit else 3 }}" class="text-muted">No holiday or exam exceptions configured.</td></tr>{% endfor %}
+</tbody></table></div></section>
+{% endif %}
+{% endblock %}
+B.27  Login Page
+File: web/templates/login.html
+{% extends 'base.html' %}{% block title %}Sign in{% endblock %}
+{% block public_content %}<div class="login-layout"><section class="login-brand-panel"><div class="login-brand"><span class="brand-mark brand-mark-large">A</span><div><strong>AuraVision</strong><small>SMART RETAIL ANALYTICS</small></div></div><div class="login-hero"><div class="eyebrow">SEE MORE. KNOW MORE.</div><h1>Intelligence for<br>every space.</h1><p>Turn real-world activity into clear, actionable insight with one intelligent analytics platform.</p><div class="login-art" aria-hidden="true"><div class="art-ring ring-one"></div><div class="art-ring ring-two"></div><div class="art-core">AV</div><span class="art-node node-one"></span><span class="art-node node-two"></span><span class="art-node node-three"></span></div></div><div class="login-panel-footer">PRIVATE • INSIGHTFUL • REAL-TIME</div></section><section class="login-form-panel"><div class="login-form-wrap"><div class="mobile-login-brand"><span class="brand-mark">A</span><strong>AuraVision</strong></div><div class="eyebrow text-primary">WELCOME BACK</div><h2>Sign in to your account</h2><p class="muted-copy">Enter your credentials to access the dashboard.</p><form method="post" action="{{ url_for('auth.login', next=request.args.get('next','')) }}" class="needs-validation"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><div class="mb-3"><label class="form-label" for="username">Username</label><input class="form-control form-control-lg" id="username" name="username" autocomplete="username" maxlength="50" required autofocus><div class="invalid-feedback">Enter your username.</div></div><div class="mb-4"><label class="form-label" for="password">Password</label><input class="form-control form-control-lg" id="password" name="password" type="password" autocomplete="current-password" required><div class="invalid-feedback">Enter your password.</div><div class="form-text">Access is limited by your assigned role.</div></div><button class="btn btn-primary btn-lg w-100" type="submit">Sign in <span aria-hidden="true">→</span></button></form><p class="login-security"><span class="status-dot"></span> Protected sign-in • Secure session</p></div><div class="login-copyright">© AuraVision Smart Retail Analytics</div></section></div>{% endblock %}
+B.28  Rules Page
+File: web/templates/rules.html
+{% extends 'base.html' %}{% block title %}Rules engine{% endblock %}{% block content %}<div class="page-heading"><div><div class="breadcrumbs">Workspace <span>/</span> Rules engine</div><h1>Rules engine</h1><p>Configure how the system identifies restricted presence and occupancy limits.</p></div></div>{% if not site %}<div class="panel empty-state"><div class="empty-icon">◇</div><h3>No site selected</h3><p>Add a site to configure its rules.</p></div>{% elif not rules %}<div class="panel empty-state"><div class="empty-icon">◇</div><h3>No rules configured</h3><p>Add a rule row to the <code>rules</code> table for {{ site.name }}. This page edits existing rules only.</p></div>{% else %}<div class="rules-grid rules-form-layout">{% for rule in rules %}<section class="panel rule-card"><div class="rule-card-head"><div class="rule-symbol">{{ '◉' if rule.rule_type == 'restricted_presence' else '⌂' }}</div><div class="flex-grow-1"><span class="eyebrow">RULE #{{ rule.rule_id }}</span><h2>{{ 'Restricted presence' if rule.rule_type == 'restricted_presence' else 'Occupancy limit' }}</h2></div><span class="status-badge {{ 'normal' if rule.is_active else 'inactive' }}">{{ 'Enabled' if rule.is_active else 'Disabled' }}</span></div><p class="rule-description">{% if rule.rule_type == 'restricted_presence' %}Raise an incident when people remain in a monitored area for the configured duration during a restricted period.{% else %}Raise an incident when the number of people in a monitored area reaches the configured occupancy threshold.{% endif %}</p><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="rule_id" value="{{ rule.rule_id }}"><div class="rule-fields"><div class="rule-field"><label class="form-label" for="people{{ rule.rule_id }}">Minimum people</label><input id="people{{ rule.rule_id }}" class="form-control" type="number" name="min_people" min="1" max="32767" value="{{ rule.min_people }}" required><div class="form-text">Minimum people needed to trigger evaluation.</div></div><div class="rule-field"><label class="form-label" for="duration{{ rule.rule_id }}">Minimum duration (sec)</label><input id="duration{{ rule.rule_id }}" class="form-control" type="number" name="min_duration_sec" min="0" max="2147483647" value="{{ rule.min_duration_sec }}" required><div class="form-text">How long the condition must persist.</div></div><div class="rule-field"><label class="form-label" for="clear{{ rule.rule_id }}">Clear after (sec)</label><input id="clear{{ rule.rule_id }}" class="form-control" type="number" name="clear_after_sec" min="0" max="2147483647" value="{{ rule.clear_after_sec }}" required><div class="form-text">Clear condition after this period.</div></div><div class="rule-field"><label class="form-label" for="cooldown{{ rule.rule_id }}">Cooldown (sec)</label><input id="cooldown{{ rule.rule_id }}" class="form-control" type="number" name="cooldown_sec" min="0" max="2147483647" value="{{ rule.cooldown_sec }}" required><div class="form-text">Wait time before a repeat alert.</div></div></div><div class="rule-card-footer"><label class="form-check form-switch"><input class="form-check-input" type="checkbox" name="is_active" value="1" {% if rule.is_active %}checked{% endif %}><span class="form-check-label">Rule enabled</span></label><button class="btn btn-primary">Save rule</button></div></form></section>{% endfor %}</div>{% endif %}{% endblock %}
+B.29  Cameras Page
+File: web/templates/cameras.html
+{% extends 'base.html' %}{% block title %}Cameras{% endblock %}{% block content %}<div class="page-heading"><div><div class="breadcrumbs">Workspace <span>/</span> Cameras</div><h1>Camera inventory</h1><p>Manage camera sources and their site assignments.</p></div><div class="heading-actions"><button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#cameraAdd">＋ Add camera</button></div></div><section class="panel"><div class="panel-heading"><div><h2>Configured cameras</h2><p>Camera sources used by the analytics worker.</p></div><span class="subtle-chip">{{ cameras|length }} total</span></div><div class="table-responsive"><table class="table table-striped table-hover align-middle"><thead><tr><th>Camera</th><th>Site / floor</th><th>Source type</th><th>Frame stride</th><th>Status</th><th class="text-end">Actions</th></tr></thead><tbody>{% for c in cameras %}<tr><td><div class="table-primary-text">{{ c.name }}</div><small class="table-subtext">ID {{ c.camera_id }}</small></td><td><strong>{{ c.site_name }}</strong><small class="table-subtext">{{ c.floor_label or 'Floor not specified' }}</small></td><td><span class="channel-chip">{{ c.source_type|upper }}</span><small class="table-subtext break-word">{{ c.source_uri }}</small></td><td>{{ c.frame_stride }}</td><td>{% if c.is_active %}<span class="status-badge normal">Active</span>{% else %}<span class="status-badge inactive">Inactive</span>{% endif %}</td><td class="text-end"><div class="table-actions"><button class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#cameraEdit{{ c.camera_id }}">Edit</button><button class="btn btn-sm btn-outline-danger" data-bs-toggle="modal" data-bs-target="#cameraDelete{{ c.camera_id }}">Delete</button></div></td></tr><div class="modal fade" id="cameraEdit{{ c.camera_id }}" tabindex="-1"><div class="modal-dialog modal-lg"><div class="modal-content"><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="action" value="edit"><input type="hidden" name="camera_id" value="{{ c.camera_id }}"><div class="modal-header"><h2 class="modal-title fs-5">Edit camera</h2><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><div class="row g-3"><div class="col-md-6"><label class="form-label">Camera name</label><input name="name" class="form-control" maxlength="100" value="{{ c.name }}" required></div><div class="col-md-6"><label class="form-label">Site</label><select name="site_id" class="form-select" required>{% for s in sites %}<option value="{{ s.site_id }}" {% if s.site_id==c.site_id %}selected{% endif %}>{{ s.name }}</option>{% endfor %}</select></div><div class="col-md-6"><label class="form-label">Floor / location label</label><input name="floor_label" class="form-control" maxlength="30" value="{{ c.floor_label or '' }}"></div><div class="col-md-6"><label class="form-label">Source type</label><select name="source_type" class="form-select">{% for typ in ['file','rtsp','webcam'] %}<option value="{{ typ }}" {% if typ==c.source_type %}selected{% endif %}>{{ typ|upper }}</option>{% endfor %}</select></div><div class="col-12"><label class="form-label">Source URI</label><input name="source_uri" class="form-control" maxlength="500" value="{{ c.source_uri }}" required><div class="form-text">For webcam sources, enter the camera index as text (for example, 0).</div></div><div class="col-md-6"><label class="form-label">Frame stride</label><input name="frame_stride" type="number" class="form-control" min="1" max="255" value="{{ c.frame_stride }}" required></div><div class="col-md-6"><label class="form-label">Status</label><select name="is_active" class="form-select"><option value="1" {% if c.is_active %}selected{% endif %}>Active</option><option value="0" {% if not c.is_active %}selected{% endif %}>Inactive</option></select></div></div></div><div class="modal-footer"><button type="button" class="btn btn-light" data-bs-dismiss="modal">Cancel</button><button class="btn btn-primary">Save camera</button></div></form></div></div></div><div class="modal fade" id="cameraDelete{{ c.camera_id }}" tabindex="-1"><div class="modal-dialog modal-sm modal-dialog-centered"><div class="modal-content"><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="action" value="delete"><input type="hidden" name="camera_id" value="{{ c.camera_id }}"><div class="modal-header"><h2 class="modal-title fs-5">Delete camera?</h2><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><strong>{{ c.name }}</strong> will be deleted. Related zones may also be removed; historical rows may prevent deletion.</div><div class="modal-footer"><button type="button" class="btn btn-light" data-bs-dismiss="modal">Cancel</button><button class="btn btn-danger">Delete</button></div></form></div></div></div>{% else %}<tr><td colspan="6"><div class="table-empty"><span class="empty-icon">▣</span><strong>No cameras configured</strong><span>Add a camera source to start building your inventory.</span></div></td></tr>{% endfor %}</tbody></table></div></section><div class="modal fade" id="cameraAdd" tabindex="-1"><div class="modal-dialog modal-lg"><div class="modal-content"><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="action" value="add"><div class="modal-header"><h2 class="modal-title fs-5">Add camera</h2><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><div class="row g-3"><div class="col-md-6"><label class="form-label">Camera name</label><input name="name" class="form-control" maxlength="100" required></div><div class="col-md-6"><label class="form-label">Site</label><select name="site_id" class="form-select" required>{% for s in sites %}<option value="{{ s.site_id }}" {% if site and site.site_id==s.site_id %}selected{% endif %}>{{ s.name }}</option>{% endfor %}</select></div><div class="col-md-6"><label class="form-label">Floor / location label</label><input name="floor_label" class="form-control" maxlength="30" placeholder="e.g. Ground floor"></div><div class="col-md-6"><label class="form-label">Source type</label><select name="source_type" class="form-select" required><option value="file">Video file</option><option value="rtsp">RTSP stream</option><option value="webcam">Webcam</option></select></div><div class="col-12"><label class="form-label">Source URI</label><input name="source_uri" class="form-control" maxlength="500" placeholder="path, RTSP URL, or webcam index (0)" required><div class="form-text">Webcam indexes are stored as text, e.g. 0.</div></div><div class="col-md-6"><label class="form-label">Frame stride</label><input name="frame_stride" type="number" class="form-control" min="1" max="255" value="2" required></div><div class="col-md-6"><label class="form-label">Status</label><select name="is_active" class="form-select"><option value="1" selected>Active</option><option value="0">Inactive</option></select></div></div></div><div class="modal-footer"><button type="button" class="btn btn-light" data-bs-dismiss="modal">Cancel</button><button class="btn btn-primary">Add camera</button></div></form></div></div></div>{% endblock %}
+B.30  Recipients Page
+File: web/templates/recipients.html
+{% extends 'base.html' %}{% block title %}Recipients{% endblock %}{% block content %}<div class="page-heading"><div><div class="breadcrumbs">Workspace <span>/</span> Recipients</div><h1>Notification recipients</h1><p>Manage the contacts and channels that receive incident notifications.</p></div><div class="heading-actions">{% if site %}<button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#recipientAdd">＋ Add recipient</button>{% endif %}</div></div>{% if not site %}<div class="panel empty-state"><div class="empty-icon">♧</div><h3>No site selected</h3><p>Add a site before configuring recipients.</p></div>{% else %}<section class="panel"><div class="panel-heading"><div><h2>Recipient directory</h2><p>{{ recipients|length }} contact(s) for {{ site.name }}.</p></div><span class="subtle-chip">{{ recipients|length }} total</span></div><div class="table-responsive"><table class="table table-striped table-hover align-middle"><thead><tr><th>Name</th><th>Channel</th><th>Destination</th><th class="text-end">Actions</th></tr></thead><tbody>{% for r in recipients %}<tr><td><div class="table-primary-text">{{ r.name }}</div><small class="table-subtext">ID {{ r.recipient_id }}</small></td><td><span class="channel-chip">{{ r.channel|title }}</span></td><td class="break-word">{{ r.address }}</td><td class="text-end"><div class="table-actions"><button class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#recipientEdit{{ r.recipient_id }}">Edit</button><button class="btn btn-sm btn-outline-danger" data-bs-toggle="modal" data-bs-target="#recipientDelete{{ r.recipient_id }}">Delete</button></div></td></tr><div class="modal fade" id="recipientEdit{{ r.recipient_id }}" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="action" value="edit"><input type="hidden" name="recipient_id" value="{{ r.recipient_id }}"><div class="modal-header"><h2 class="modal-title fs-5">Edit recipient</h2><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><div class="mb-3"><label class="form-label">Name</label><input name="name" class="form-control" maxlength="80" value="{{ r.name }}" required></div><div class="mb-3"><label class="form-label">Channel</label><select name="channel" class="form-select" required>{% for c in ['telegram','email','sms'] %}<option value="{{ c }}" {% if c==r.channel %}selected{% endif %}>{{ c|title }}</option>{% endfor %}</select></div><div><label class="form-label">Destination / address</label><input name="address" class="form-control" maxlength="150" value="{{ r.address }}" required><div class="form-text">Email address, phone number, or Telegram destination identifier.</div></div></div><div class="modal-footer"><button type="button" class="btn btn-light" data-bs-dismiss="modal">Cancel</button><button class="btn btn-primary">Save changes</button></div></form></div></div></div><div class="modal fade" id="recipientDelete{{ r.recipient_id }}" tabindex="-1"><div class="modal-dialog modal-sm modal-dialog-centered"><div class="modal-content"><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="action" value="delete"><input type="hidden" name="recipient_id" value="{{ r.recipient_id }}"><div class="modal-header"><h2 class="modal-title fs-5">Delete recipient?</h2><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body">Remove <strong>{{ r.name }}</strong> from this site's recipient list?</div><div class="modal-footer"><button type="button" class="btn btn-light" data-bs-dismiss="modal">Cancel</button><button class="btn btn-danger">Delete</button></div></form></div></div></div>{% else %}<tr><td colspan="4"><div class="table-empty"><span class="empty-icon">♧</span><strong>No recipients yet</strong><span>Add a recipient to configure notification destinations.</span></div></td></tr>{% endfor %}</tbody></table></div></section><div class="modal fade" id="recipientAdd" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="action" value="add"><div class="modal-header"><h2 class="modal-title fs-5">Add recipient</h2><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><div class="mb-3"><label class="form-label">Name</label><input name="name" class="form-control" maxlength="80" required></div><div class="mb-3"><label class="form-label">Channel</label><select name="channel" class="form-select" required><option value="telegram">Telegram</option><option value="email">Email</option><option value="sms">SMS</option></select></div><div><label class="form-label">Destination / address</label><input name="address" class="form-control" maxlength="150" required><div class="form-text">Use a destination appropriate for the selected channel.</div></div></div><div class="modal-footer"><button type="button" class="btn btn-light" data-bs-dismiss="modal">Cancel</button><button class="btn btn-primary">Add recipient</button></div></form></div></div></div>{% endif %}{% endblock %}
+B.31  Not Found Page
+File: web/templates/404.html
+{% extends 'base.html' %}{% block title %}{{ code|default(404) }} • Page unavailable{% endblock %}{% block content %}<div class="error-page"><div class="error-icon">⌁</div><div class="eyebrow">REQUEST NOT COMPLETED</div><h1>{{ code|default(404) }}</h1><h2>We couldn't open that page.</h2><p>{{ message|default('The page you are looking for does not exist.') }}</p><a class="btn btn-primary" href="{{ url_for('dashboard') if current_user else url_for('auth.login') }}">Return to {{ 'dashboard' if current_user else 'sign in' }}</a></div>{% endblock %}{% block public_content %}<div class="error-page public-error"><div class="error-icon">⌁</div><div class="eyebrow">REQUEST NOT COMPLETED</div><h1>{{ code|default(404) }}</h1><h2>We couldn't open that page.</h2><p>{{ message|default('The page you are looking for does not exist.') }}</p><a class="btn btn-primary" href="{{ url_for('auth.login') }}">Return to sign in</a></div>{% endblock %}
